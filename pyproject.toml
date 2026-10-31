@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feather-ops"
+version = "0.1.0"
+description = "Fast fp16-fp8 mixed precision matmul on RDNA3/3.5 without native fp8"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+# We deliberately avoid declaring torch as a dependency because it's nontrivial to install
+dependencies = []
+
+[tool.ruff]
+line-length = 180
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ty.analysis]
+replace-imports-with-any = ["triton", "triton.**"]
+
+[tool.ty.environment]
+python-version = "3.11"

@@ -1,0 +1,113 @@
+import torch
+from torch._inductor.kernel.custom_op import register_custom_op_autotuning
+
+from .autotune import AUTOTUNE_CONFIGS, generate_autotune_configs, get_compatible_config, old_autotune
+
+_CONFIGS = list(AUTOTUNE_CONFIGS)
+
+
+@torch.library.custom_op("feather_ops_internal::mm_fp16_configured", mutates_args=())
+def _configured_op(
+    a: torch.Tensor,
+    b_prepacked: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    block_warps_m: int,
+    block_warps_n: int,
+    unroll_k: int,
+    repeat_m: int,
+    repeat_n: int,
+) -> torch.Tensor:
+    out = torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
+    torch.ops.feather_ops.mm_fp16.default(
+        a,
+        b_prepacked,
+        bias,
+        out,
+        block_warps_m,
+        block_warps_n,
+        unroll_k,
+        repeat_m,
+        repeat_n,
+    )
+    return out
+
+
+@_configured_op.register_fake
+def _(
+    a: torch.Tensor,
+    b_prepacked: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    block_warps_m: int,
+    block_warps_n: int,
+    unroll_k: int,
+    repeat_m: int,
+    repeat_n: int,
+) -> torch.Tensor:
+    return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
+
+
+mm_hip_fp16_configured = _configured_op
+
+
+@torch.library.custom_op("feather_ops_internal::mm_fp16_autotuned", mutates_args=())
+def _autotuned_op(
+    a: torch.Tensor,
+    b_prepacked: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    block_warps_m: int = 0,
+    block_warps_n: int = 0,
+    unroll_k: int = 0,
+    repeat_m: int = 0,
+    repeat_n: int = 0,
+) -> torch.Tensor:
+    if min(block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n) <= 0:
+        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n = get_compatible_config(a, b_prepacked, 1, _CONFIGS)
+    return _configured_op(a, b_prepacked, bias, out_dtype, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
+
+
+@_autotuned_op.register_fake
+def _(
+    a: torch.Tensor,
+    b_prepacked: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    block_warps_m: int = 0,
+    block_warps_n: int = 0,
+    unroll_k: int = 0,
+    repeat_m: int = 0,
+    repeat_n: int = 0,
+) -> torch.Tensor:
+    return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
+
+
+register_custom_op_autotuning(_autotuned_op, config_generator=lambda fake_tensors: generate_autotune_configs(fake_tensors, _CONFIGS, 1))
+
+
+def mm_hip_fp16(
+    a: torch.Tensor,
+    b_prepacked: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    if torch.compiler.is_compiling():
+        return _autotuned_op(a, b_prepacked, bias, out_dtype)
+
+    def run_fn(cfg: tuple[int, int, int, int, int]) -> torch.Tensor:
+        return _configured_op(a, b_prepacked, bias, out_dtype, *cfg)
+
+    best_cfg = old_autotune(
+        a.shape[0],
+        b_prepacked.shape[1],
+        a.shape[1],
+        _CONFIGS,
+        run_fn,
+        "fp16",
+    )
+    return _configured_op(a, b_prepacked, bias, out_dtype, *best_cfg)
+
+
+def prepack_b_for_mm_fp16(b: torch.Tensor) -> torch.Tensor:
+    return b.view(b.shape[0] // 8, 8, b.shape[1]).permute(0, 2, 1).contiguous()
