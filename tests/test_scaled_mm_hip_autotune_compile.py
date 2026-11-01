@@ -11,7 +11,7 @@ ATOL = {
 }
 CONFIGURED_CASES = [
     pytest.param(_CONFIGS[0]),
-    pytest.param(_CONFIGS[-1]),
+    pytest.param((1, 8, 4, 8, 2, 4)),
 ]
 
 
@@ -43,7 +43,7 @@ def _assert_close(out: torch.Tensor, ref: torch.Tensor, out_dtype: torch.dtype) 
 
 
 @pytest.mark.parametrize("cfg", CONFIGURED_CASES)
-def test_eager_configured(cfg: tuple[int, int, int, int, int]) -> None:
+def test_eager_configured(cfg: tuple[int, int, int, int, int, int]) -> None:
     a, b, b_prepacked, scale, bias, out_dtype = _make_inputs()
     out = scaled_mm_hip_configured(a, b_prepacked, scale, bias, out_dtype, *cfg)
     ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
@@ -51,7 +51,7 @@ def test_eager_configured(cfg: tuple[int, int, int, int, int]) -> None:
 
 
 @pytest.mark.parametrize("cfg", CONFIGURED_CASES)
-def test_torch_compile_configured(cfg: tuple[int, int, int, int, int]) -> None:
+def test_torch_compile_configured(cfg: tuple[int, int, int, int, int, int]) -> None:
     a, b, b_prepacked, scale, bias, out_dtype = _make_inputs()
 
     @torch.compile(fullgraph=True, mode="max-autotune")

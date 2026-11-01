@@ -30,6 +30,8 @@ extern "C" bool launch_scaled_mm(
     const float* const scale,
     const uint16_t* const bias,
     uint16_t* const c,
+    float* workspace,
+    const int split_k_factor,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -56,13 +58,14 @@ struct Options
     int unroll_k = 4;
     int repeat_m = 8;
     int repeat_n = 2;
+    int split_k_factor = 1;
 };
 
 void print_usage(const char* argv0)
 {
     std::cout << "Usage: " << argv0
-              << " [--m M] [--n N] [--k K] [--warmup W] [--iters I] [--warps_m M] [--warps_n N] [--unroll U] [--repeat_m RM] [--repeat_n RN]\n"
-              << "Defaults: --m 8192 --n 8192 --k 8192 --warmup 10 --iters 100 --warps_m 1 --warps_n 8 --unroll 4 --repeat_m 8 --repeat_n 2\n";
+              << " [--m M] [--n N] [--k K] [--warmup W] [--iters I] [--warps_m M] [--warps_n N] [--unroll U] [--repeat_m RM] [--repeat_n RN] [--split_k SK]\n"
+              << "Defaults: --m 8192 --n 8192 --k 8192 --warmup 10 --iters 100 --warps_m 1 --warps_n 8 --unroll 4 --repeat_m 8 --repeat_n 2 --split_k 1\n";
 }
 
 Options parse_args(int argc, char** argv)
@@ -90,6 +93,7 @@ Options parse_args(int argc, char** argv)
         else if (arg == "--unroll") { need_value("--unroll"); opts.unroll_k = std::stoi(argv[++i]); }
         else if (arg == "--repeat_m") { need_value("--repeat_m"); opts.repeat_m = std::stoi(argv[++i]); }
         else if (arg == "--repeat_n") { need_value("--repeat_n"); opts.repeat_n = std::stoi(argv[++i]); }
+        else if (arg == "--split_k") { need_value("--split_k"); opts.split_k_factor = std::stoi(argv[++i]); }
         else if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
@@ -103,9 +107,9 @@ Options parse_args(int argc, char** argv)
         }
     }
 
-    if (opts.m <= 0 || opts.n <= 0 || opts.k <= 0 || opts.warmup_iters < 0 || opts.iters <= 0)
+    if (opts.m <= 0 || opts.n <= 0 || opts.k <= 0 || opts.warmup_iters < 0 || opts.iters <= 0 || opts.split_k_factor <= 0)
     {
-        std::cerr << "All sizes must be positive, warmup must be non-negative, and iters must be positive."
+        std::cerr << "All sizes and split_k must be positive, warmup must be non-negative, and iters must be positive."
                   << std::endl;
         std::exit(EXIT_FAILURE);
     }
@@ -154,6 +158,10 @@ int main(int argc, char** argv)
         std::cerr << "K must be divisible by 16 * unroll_k (" << chunk_k << ")" << std::endl;
         return 1;
     }
+    if ((opts.k / chunk_k) % opts.split_k_factor != 0) {
+        std::cerr << "Total chunks (" << (opts.k / chunk_k) << ") must be divisible by split_k_factor (" << opts.split_k_factor << ")" << std::endl;
+        return 1;
+    }
 
     const size_t a_elems = static_cast<size_t>(opts.m) * opts.k;
     const size_t b_elems = static_cast<size_t>(opts.k) * opts.n;
@@ -170,12 +178,16 @@ int main(int argc, char** argv)
     float* d_scale = nullptr;
     half* d_bias = nullptr;
     half* d_c = nullptr;
+    float* d_workspace = nullptr;
 
     CHECK_HIP(hipMalloc(&d_a, a_elems * sizeof(half)));
     CHECK_HIP(hipMalloc(&d_b_prepacked, b_elems * sizeof(uint8_t)));
     CHECK_HIP(hipMalloc(&d_scale, sizeof(float)));
     CHECK_HIP(hipMalloc(&d_bias, opts.n * sizeof(half)));
     CHECK_HIP(hipMalloc(&d_c, c_elems * sizeof(half)));
+    if (opts.split_k_factor > 1) {
+        CHECK_HIP(hipMalloc(&d_workspace, static_cast<size_t>(opts.split_k_factor) * c_elems * sizeof(float)));
+    }
 
     fill_random_half(d_a, a_elems);
     fill_random_fp8e5m2(d_b_prepacked, b_elems);
@@ -202,6 +214,8 @@ int main(int argc, char** argv)
             d_scale,
             reinterpret_cast<const uint16_t*>(d_bias),
             reinterpret_cast<uint16_t*>(d_c),
+            d_workspace,
+            opts.split_k_factor,
             opts.m, opts.n, opts.k,
             1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
@@ -227,6 +241,8 @@ int main(int argc, char** argv)
             d_scale,
             reinterpret_cast<const uint16_t*>(d_bias),
             reinterpret_cast<uint16_t*>(d_c),
+            d_workspace,
+            opts.split_k_factor,
             opts.m, opts.n, opts.k,
             1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
@@ -262,7 +278,7 @@ int main(int argc, char** argv)
     std::cout << "scaled_mm benchmark\n";
     std::cout << "  problem: m=" << opts.m << " n=" << opts.n << " k=" << opts.k << "\n";
     std::cout << "  config: warps_m=" << opts.block_warps_m << " warps_n=" << opts.block_warps_n
-              << " unroll_k=" << opts.unroll_k << " repeat_m=" << opts.repeat_m << " repeat_n=" << opts.repeat_n << "\n";
+              << " unroll_k=" << opts.unroll_k << " repeat_m=" << opts.repeat_m << " repeat_n=" << opts.repeat_n << " split_k=" << opts.split_k_factor << "\n";
     std::cout << "  memory footprint: " << (matrix_bytes_total / (1024.0 * 1024.0)) << " MiB\n";
     std::cout << "  avg ms: " << avg_ms << "\n";
     std::cout << "  std ms: " << std_ms << "\n";
@@ -274,6 +290,9 @@ int main(int argc, char** argv)
     CHECK_HIP(hipEventDestroy(stop));
     CHECK_HIP(hipEventDestroy(start));
     CHECK_HIP(hipStreamDestroy(stream));
+    if (d_workspace != nullptr) {
+        CHECK_HIP(hipFree(d_workspace));
+    }
     CHECK_HIP(hipFree(d_c));
     CHECK_HIP(hipFree(d_bias));
     CHECK_HIP(hipFree(d_scale));

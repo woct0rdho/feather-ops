@@ -34,22 +34,22 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-def _block_sizes(cfg: tuple[int, int, int, int, int]) -> tuple[int, int, int]:
-    warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
-    return 16 * warps_m * repeat_m, 16 * warps_n * repeat_n, 16 * unroll_k
+def _block_sizes(cfg: tuple[int, int, int, int, int, int]) -> tuple[int, int, int, int]:
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n, split_k = cfg
+    return 16 * warps_m * repeat_m, 16 * warps_n * repeat_n, 16 * unroll_k, split_k
 
 
-def _shape_compatible(cfg: tuple[int, int, int, int, int], shape: tuple[int, int, int]) -> bool:
-    block_m, block_n, chunk_k = _block_sizes(cfg)
+def _shape_compatible(cfg: tuple[int, int, int, int, int, int], shape: tuple[int, int, int]) -> bool:
+    block_m, block_n, chunk_k, split_k = _block_sizes(cfg)
     M, N, K = shape
-    return M % block_m == 0 and N % block_n == 0 and K % chunk_k == 0
+    return M % block_m == 0 and N % block_n == 0 and K % chunk_k == 0 and (K // chunk_k) % split_k == 0
 
 
 CASES = [pytest.param(cfg, shape, b_dtype, out_dtype) for cfg in _CONFIGS for shape in TEST_SIZES if _shape_compatible(cfg, shape) for b_dtype, out_dtype in DTYPE_COMBOS]
 
 
 def _check_config(
-    cfg: tuple[int, int, int, int, int],
+    cfg: tuple[int, int, int, int, int, int],
     shape: tuple[int, int, int],
     b_dtype: torch.dtype,
     out_dtype: torch.dtype,
@@ -73,7 +73,7 @@ def _check_config(
 
 @pytest.mark.parametrize("cfg,shape,b_dtype,out_dtype", CASES)
 def test_config(
-    cfg: tuple[int, int, int, int, int],
+    cfg: tuple[int, int, int, int, int, int],
     shape: tuple[int, int, int],
     b_dtype: torch.dtype,
     out_dtype: torch.dtype,
