@@ -13,6 +13,7 @@ SOURCES = [
     "csrc/extension.cpp",
     "csrc/hip_kernel.cu",
     "csrc/hip_kernel_fp16.cu",
+    "csrc/hip_kernel_int8.cu",
     "csrc/hipblaslt_kernel_fp16.cu",
 ]
 HEADER_DEPENDENCIES = [path.relative_to(ROOT).as_posix() for pattern in ("*.h", "*.cuh") for path in sorted(CSRC.rglob(pattern))]

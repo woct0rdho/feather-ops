@@ -215,7 +215,7 @@ __global__ void scaled_mm_kernel(
 
         const int a_owner_tid = kEnableAWsgr ? (wave_id * kWaveSize + lane) : tid;
 
-        // Physical LDS space is traversed directly; global logical row is obtained by inverse map.
+        // Physical LDS space is traversed directly. Global logical row is obtained by inverse map.
         #pragma unroll
         for (int v = 0; v < kAVecsPerOwnerThread; ++v) {
             const int vec_idx = a_owner_tid + v * kAOwnerThreads;

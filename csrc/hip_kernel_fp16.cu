@@ -436,7 +436,7 @@ constexpr bool should_enable_a_wsgr_by_heuristic(const int64_t M)
     }
 
     // Region 2: repeat_m=2 only helps on tall wave layouts.
-    // u=2 stays mildly positive across the sweep; u=4 flips on at M ~= 512.
+    // u=2 stays mildly positive across the sweep. u=4 flips on at M ~= 512.
     if constexpr (Config::kRepeatM == 2) {
         if constexpr (Config::kBlockWarpsM > Config::kBlockWarpsN) {
             return Config::kUnrollK == 2 || M >= 512;
