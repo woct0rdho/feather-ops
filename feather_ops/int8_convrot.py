@@ -68,8 +68,15 @@ def select_int8_config(M: int, N: int, K: int, transposed_b: bool) -> tuple[int,
         return _TILE_NARROW
     if out >= 6144:
         return _TILE_WIDE
-    if transposed_b and out >= 3072 and contraction >= 8192:
-        # backward with a long reduction: the 256x256 tile halves the number of dY panels per weight tile
+    if out >= 3072 and contraction >= 2048:
+        # mid-width output: the 256x256 tile halves the number of A panels, which is what the cells with a real
+        # reduction axis want in both directions (measured +3.4% to +7.9% over 128x128 on Z-Image 3840x*, H3's
+        # out_proj/fc2 5376x*, MOSS 3072x*, and the gradients of the same families).
+        # Exception: a power-of-two contraction up to 8192 at a small M aliases the L2 sets with a 256-wide
+        # tile (Qwen-Image / Klein 4096x4096 at M=4112 is 3.5% faster on 128x128 while M=9232 prefers 256x256.
+        # A 16384-wide contraction at the same M prefers 256x256, so the exception stops at 8192).
+        if 4096 <= contraction <= 8192 and (contraction & (contraction - 1)) == 0 and M < 8192:
+            return _TILE_MID
         return _TILE_WIDE
     if out < 2048 and contraction >= 4096:
         # narrow output with a long reduction: the 128x256 tile keeps twice the A panel per block

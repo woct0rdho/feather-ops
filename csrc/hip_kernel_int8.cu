@@ -671,31 +671,77 @@ __device__ __forceinline__ float wave_max(float v) {
     return v;
 }
 
-// One radix-4 Walsh stage over index digit `shift` of the group's 256 values, in place in LDS.
-// The staged values stay in fp32: rounding them to bf16 per stage would cost four mantissa roundings
-// instead of the single one the reference recipe applies to the finished rotation.
-__device__ __forceinline__ void radix4_stage(float* const row, const int g, const int shift, const int lane) {
-    const int stride = 1 << shift;
-    float out[kQuantPerLane];
+// The group's 256 values live in one wave, 8 per lane (`v[i]` is element `lane * 8 + i`). The regular
+// Hadamard is `h4^(x)4`, so each stage acts on one index digit `shift` bit-pair: element `e` belongs to the
+// group `{base, base + stride, base + 2*stride, base + 3*stride}`, `base = e & ~(3 << shift)`, and its output
+// is `sum - 2 * a[3 - d]`, `d = (e >> shift) & 3` (each row of h4 has exactly one -1). The values stay in
+// fp32 registers through all four stages - rounding per stage would cost four mantissa roundings instead of
+// the single one the reference recipe applies to the finished rotation - and the exchanges are register
+// shuffles instead of an LDS round trip per stage:
+//   shift 0 (stride 1)  : the group is four consecutive values of this lane, no exchange
+//   shift 2 (stride 4)  : the group is {own[i], own[i+4], partner[i], partner[i+4]}, partner = lane ^ 1
+//   shift 4 (stride 16) : the four values are at lanes `lane ^ (2 * (d ^ j))`, mirror `lane ^ 6`
+//   shift 6 (stride 64) : the four values are at lanes `lane ^ (8 * (d ^ j))`, mirror `lane ^ 24`
+// The complement of a stage is always the mirror element, i.e. `a[3 - d]` among the four values already
+// fetched, so the two wide stages cost four shuffles per value and nothing else.
+__device__ __forceinline__ void radix4_wave(float (&v)[kQuantPerLane], const int lane) {
+    // stage 0, digit 0 (stride 1): four consecutive values of this lane
+    {
+        float out[kQuantPerLane];
 #pragma unroll
-    for (int i = 0; i < kQuantPerLane; ++i) {
-        const int e = lane * kQuantPerLane + i;
-        const int base = e & ~(3 << shift);
-        const float a0 = row[g + base];
-        const float a1 = row[g + base + stride];
-        const float a2 = row[g + base + 2 * stride];
-        const float a3 = row[g + base + 3 * stride];
-        const int d = (e >> shift) & 3;
-        const float complement = (d == 0) ? a3 : (d == 1) ? a2 : (d == 2) ? a1 : a0;
-        out[i] = (a0 + a1 + a2 + a3) - 2.0f * complement;
-    }
-    // Read all partners before writing any of them back.
-    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        for (int i = 0; i < kQuantPerLane; ++i) {
+            const int base = i & ~3;
+            const int d = i & 3;
+            const float a0 = v[base];
+            const float a1 = v[base + 1];
+            const float a2 = v[base + 2];
+            const float a3 = v[base + 3];
+            const float complement = (d == 0) ? a3 : (d == 1) ? a2 : (d == 2) ? a1 : a0;
+            out[i] = (a0 + a1 + a2 + a3) - 2.0f * complement;
+        }
 #pragma unroll
-    for (int i = 0; i < kQuantPerLane; ++i) {
-        row[g + lane * kQuantPerLane + i] = out[i];
+        for (int i = 0; i < kQuantPerLane; ++i) v[i] = out[i];
     }
-    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    // stage 1, digit 2 (stride 4): the partner lane holds the other half of every group
+    {
+        float partner[kQuantPerLane];
+#pragma unroll
+        for (int i = 0; i < kQuantPerLane; ++i) partner[i] = __shfl_xor(v[i], 1);
+        const bool odd = (lane & 1) != 0;
+        float out[kQuantPerLane];
+#pragma unroll
+        for (int i = 0; i < kQuantPerLane; ++i) {
+            const int q = i & 3;
+            // the group in index order starts with this lane's pair on an even lane and with the partner's on an odd one
+            const float x0 = odd ? partner[q] : v[q];
+            const float x1 = odd ? partner[q + 4] : v[q + 4];
+            const float x2 = odd ? v[q] : partner[q];
+            const float x3 = odd ? v[q + 4] : partner[q + 4];
+            // mirror element: partner[q + 4] for the first half of the digit and partner[q] for the second
+            const float complement = partner[q + ((i < 4) ? 4 : 0)];
+            out[i] = ((x0 + x1) + x2) + x3 - 2.0f * complement;
+        }
+#pragma unroll
+        for (int i = 0; i < kQuantPerLane; ++i) v[i] = out[i];
+    }
+    // stages 2 and 3, digits 4 and 6 (strides 16 and 64): every value of the group is in another lane
+#pragma unroll
+    for (int stage = 0; stage < 2; ++stage) {
+        const int unit = 2 << (2 * stage);                     // lane stride of one stride element: 2, then 8
+        const int digit = (lane >> (1 + 2 * stage)) & 3;       // d of this lane
+        float out[kQuantPerLane];
+#pragma unroll
+        for (int i = 0; i < kQuantPerLane; ++i) {
+            const float a0 = __shfl_xor(v[i], unit * digit);
+            const float a1 = __shfl_xor(v[i], unit * (digit ^ 1));
+            const float a2 = __shfl_xor(v[i], unit * (digit ^ 2));
+            const float a3 = __shfl_xor(v[i], unit * (digit ^ 3));
+            const float complement = (digit == 0) ? a3 : (digit == 1) ? a2 : (digit == 2) ? a1 : a0;
+            out[i] = ((a0 + a1) + a2) + a3 - 2.0f * complement;
+        }
+#pragma unroll
+        for (int i = 0; i < kQuantPerLane; ++i) v[i] = out[i];
+    }
 }
 
 // Four rounded int8 codes packed into one dword: two saturating i32->i16 packs and one byte permute, instead
@@ -738,14 +784,14 @@ __device__ __forceinline__ float as_input_rounded(const float v) {
     }
 }
 
-// Produce one 256-value group into a wave's fp32 LDS slot: load it (folding the per-column scale when the
+// Produce one 256-value group into this lane's registers: load it (folding the per-column scale when the
 // rotation is off), then, for the forward, run the four radix-4 Hadamard stages. The staged row and the
 // wide-row streaming path both call this, so both apply exactly the same arithmetic to the same inputs.
 template <bool kInputFp16>
 __device__ __forceinline__ void produce_group(
     const uint16_t* __restrict__ x_row,
     const float* __restrict__ col_scale,
-    float* const slot,
+    float (&v)[kQuantPerLane],
     const int g,
     const int lane,
     const int rotate)
@@ -755,27 +801,22 @@ __device__ __forceinline__ void produce_group(
     for (int i = 0; i < kQuantPerLane; ++i) {
         float value = input_bits_to_float<kInputFp16>(x_row[g + base + i]);
         if (!rotate && col_scale != nullptr) value = as_input_rounded<kInputFp16>(value * col_scale[g + base + i]);
-        slot[base + i] = value;
+        v[i] = value;
     }
-    if (rotate) {
-        radix4_stage(slot, 0, 0, lane);
-        radix4_stage(slot, 0, 2, lane);
-        radix4_stage(slot, 0, 4, lane);
-        radix4_stage(slot, 0, 6, lane);
-    }
+    if (rotate) radix4_wave(v, lane);
 }
 
 // One row per block. The row's 256-value groups are spread over the block's waves (one group per wave per
-// round), so the block is as wide as the row and its LDS footprint is (K bf16 of finished values) plus one
-// fp32 group slot per wave. The fp32 slot is what the radix-4 stages work in - rounding after each stage
-// would cost four mantissa roundings instead of the single one the reference recipe applies - and the
-// finished group is rounded into the bf16 row, which is where the max and the quantize pass read it from.
+// round), so the block is as wide as the row. The rotation itself stays in registers (see `radix4_wave`), so
+// the only LDS the block needs is the bf16 row buffer of the staged path - which is why the wave count no
+// longer depends on the row width and a 16384-wide row runs at the same occupancy as a 1024-wide one.
+// The finished group is rounded into the bf16 row, which is where the max and the quantize pass read it from.
 // A group's rotation stays inside its own wave (no barrier). The row absmax is the block's only reduction.
 //
 // kStageRow=false is the wide-row path (K > 16384, up to the 248320-wide Vocab projection of a 32B text
-// encoder): the finished row would no longer leave room for a full block of waves in LDS, so the quantize
-// pass recomputes each group from global memory (L2-hot) instead, which keeps 32 waves and 4 workgroups per
-// WGP. The scale and the codes are identical to the staged path because both use the same producer.
+// encoder): the bf16 row buffer would no longer leave room for a full block of waves, so the quantize pass
+// recomputes each group from global memory (L2-hot) instead, which keeps 32 waves and 4 workgroups per WGP.
+// The scale and the codes are identical to the staged path because both use the same producer.
 template <bool kInputFp16, bool kStageRow>
 __global__ void convrot_quantize_kernel(
     const uint16_t* __restrict__ x,       // [M, K] bf16 or fp16
@@ -791,23 +832,30 @@ __global__ void convrot_quantize_kernel(
     const int wave = static_cast<int>(threadIdx.x) / kWaveSize;
     const int waves = static_cast<int>(blockDim.x) / kWaveSize;
     const int64_t row = blockIdx.x;
-    float* const group_slot = smem;  // waves * 256 floats
     // The staged path keeps the finished (rotated, rounded) row for the quantize pass. The wide-row path
     // has no row buffer and recomputes each group from x instead.
-    uint16_t* const row_vals = kStageRow ? reinterpret_cast<uint16_t*>(smem + waves * kQuantGroup) : nullptr;
+    uint16_t* const row_vals = kStageRow ? reinterpret_cast<uint16_t*>(smem) : nullptr;
 
     const uint16_t* const x_row = x + row * K;
     const int lane_base = lane * kQuantPerLane;
     float vmax = 0.0f;
     for (int gidx = wave; gidx < groups_per_row; gidx += waves) {
         const int g = gidx * kQuantGroup;
-        float* const slot = group_slot + wave * kQuantGroup;
-        produce_group<kInputFp16>(x_row, col_scale, slot, g, lane, rotate);
+        float v[kQuantPerLane];
+        produce_group<kInputFp16>(x_row, col_scale, v, g, lane, rotate);
+        uint16_t bits[kQuantPerLane];
 #pragma unroll
         for (int i = 0; i < kQuantPerLane; ++i) {
-            const uint16_t bits = float_to_bits<kInputFp16>(slot[lane_base + i]);
-            if constexpr (kStageRow) row_vals[g + lane_base + i] = bits;
-            vmax = fmaxf(vmax, fabsf(input_bits_to_float<kInputFp16>(bits)));
+            bits[i] = float_to_bits<kInputFp16>(v[i]);
+            vmax = fmaxf(vmax, fabsf(input_bits_to_float<kInputFp16>(bits[i])));
+        }
+        if constexpr (kStageRow) {
+            // the eight codes are one aligned 16-byte slot of the staged row
+            *reinterpret_cast<uint4*>(row_vals + g + lane_base) = make_uint4(
+                static_cast<uint32_t>(bits[0]) | (static_cast<uint32_t>(bits[1]) << 16),
+                static_cast<uint32_t>(bits[2]) | (static_cast<uint32_t>(bits[3]) << 16),
+                static_cast<uint32_t>(bits[4]) | (static_cast<uint32_t>(bits[5]) << 16),
+                static_cast<uint32_t>(bits[6]) | (static_cast<uint32_t>(bits[7]) << 16));
         }
     }
 
@@ -832,19 +880,20 @@ __global__ void convrot_quantize_kernel(
     for (int gidx = wave; gidx < groups_per_row; gidx += waves) {
         const int g = gidx * kQuantGroup;
         const int base = g + lane_base;
-        float* const slot = group_slot + wave * kQuantGroup;
         float v[kQuantPerLane];
         if constexpr (kStageRow) {
+            const uint4 bits = *reinterpret_cast<const uint4*>(row_vals + base);
+            const uint32_t w[4] = {bits.x, bits.y, bits.z, bits.w};
 #pragma unroll
             for (int i = 0; i < kQuantPerLane; ++i) {
-                v[i] = input_bits_to_float<kInputFp16>(row_vals[base + i]);
+                v[i] = input_bits_to_float<kInputFp16>(static_cast<uint16_t>(w[i / 2] >> (16 * (i % 2))));
             }
         } else {
             // no row buffer to read back: recompute the group (x is L2-hot here)
-            produce_group<kInputFp16>(x_row, col_scale, slot, g, lane, rotate);
+            produce_group<kInputFp16>(x_row, col_scale, v, g, lane, rotate);
 #pragma unroll
             for (int i = 0; i < kQuantPerLane; ++i) {
-                v[i] = input_bits_to_float<kInputFp16>(float_to_bits<kInputFp16>(slot[lane_base + i]));
+                v[i] = input_bits_to_float<kInputFp16>(float_to_bits<kInputFp16>(v[i]));
             }
         }
         uint32_t packed[2];
@@ -871,25 +920,19 @@ extern "C" bool launch_convrot_quantize(
 {
     if (K % kQuantGroup != 0) return false;
     const int64_t groups_per_row = K / kQuantGroup;
-    // LDS budget: gfx11 allows 64 KB per workgroup (a WGP holds two such workgroups), minus the kernel's
-    // static shared memory (the per-wave maxima) and alignment slack. Staging the whole finished row costs
-    // K * 2 bytes, which only leaves a full block of waves while K <= 16384. Above that the quantize pass
-    // recomputes each group from global memory instead, so any K works without a per-workgroup limit.
+    // The rotation runs in registers, so the only LDS a block needs is the bf16 row buffer of the staged path
+    // (K * 2 bytes). Staging costs half of the 64 KB workgroup budget while K <= 16384, which still leaves a
+    // full block of waves. Above that the quantize pass recomputes each group from global memory instead, so
+    // any K works with full occupancy. (The previous version also kept an fp32 group slot per wave and
+    // budgeted a hardcoded 32 KB of total footprint, which collapsed K >= 16384 to a single wave: 32 threads,
+    // 33 KB of LDS per block, under one resident wave per SIMD, 43 GB/s.)
     constexpr int64_t kWorkgroupLdsBytes = 65536;
     constexpr int64_t kStaticLdsBytes = 256;
     constexpr int64_t kMaxStagedRowBytes = 32768;
     const bool stage_row = K * static_cast<int64_t>(sizeof(uint16_t)) <= kMaxStagedRowBytes;
     int64_t waves = groups_per_row < 32 ? groups_per_row : 32;
-    if (stage_row) {
-        // the previous budget (32 KB of total footprint) collapsed K >= 16384 to a single wave, i.e. 32 threads
-        // and 33 KB of LDS per block. The row now uses half the workgroup LDS, so a block always has >= 31 waves
-        const int64_t budget_waves = (kWorkgroupLdsBytes - kStaticLdsBytes - K * static_cast<int64_t>(sizeof(uint16_t))) /
-                                     (kQuantGroup * static_cast<int64_t>(sizeof(float)));
-        if (waves > budget_waves) waves = budget_waves;
-    }
     if (waves < 1) waves = 1;
-    const size_t smem = static_cast<size_t>(waves) * kQuantGroup * sizeof(float) +
-                        (stage_row ? static_cast<size_t>(K) * sizeof(uint16_t) : 0);
+    const size_t smem = stage_row ? static_cast<size_t>(K) * sizeof(uint16_t) : 0;
     if (smem > static_cast<size_t>(kWorkgroupLdsBytes - kStaticLdsBytes)) return false;
     const dim3 block(static_cast<uint32_t>(kWaveSize * waves), 1, 1);
     const dim3 grid(static_cast<uint32_t>(M), 1, 1);

@@ -161,6 +161,20 @@ def test_every_table_config(cfg, transposed_b):
         (4096, 8192, 2048, (256, 256)),
         (4112, 6144, 6144, (256, 256)),
         (5376, 21504, 5376, (256, 256)),
+        # mid-width outputs with a real reduction axis take the 256x256 tile
+        (5376, 5376, 7168, (256, 256)),  # H3 out_proj, +4.0% over 128x128
+        (4128, 3840, 3840, (256, 256)),  # Z-Image, +7.4%
+        (4128, 3840, 10240, (256, 256)),
+        (4112, 3072, 3072, (256, 256)),  # MOSS-Image, +4.2%
+        # ... except a power-of-two contraction at a small M (L2 aliasing with a 256-wide tile)
+        (4112, 4096, 4096, (128, 128)),  # Qwen-Image / Klein at M=4112
+        (2048, 4096, 4096, (128, 128)),
+        # a short contraction keeps the 128x128 tile
+        (2048, 4304, 1152, (128, 128)),
+        (1024, 3456, 1152, (128, 128)),
+        # an output below the mid-width class is unchanged
+        (4096, 2048, 2048, (128, 128)),
+        (4096, 2048, 8192, (128, 128)),
     ],
 )
 def test_shape_heuristic(M, N, K, expected_tile):
@@ -172,6 +186,17 @@ def test_shape_heuristic_uses_the_output_width_of_the_call():
     # the backward produces K, so a wide K makes it a wide-output call even when N is narrow
     assert select_int8_config(4096, 2048, 8192, False)[0:2] == (2, 4)  # forward: output 2048
     assert select_int8_config(4096, 2048, 8192, True)[0:2] == (4, 4)  # backward: output 8192
+
+
+def test_shape_heuristic_mid_width_output_in_both_directions():
+    # H3 out_proj (5376, 7168): forward output 5376, gradient output 7168. Both take the 256x256 tile
+    assert select_int8_config(5376, 5376, 7168, False)[0:2] == (4, 4)
+    assert select_int8_config(5376, 5376, 7168, True)[0:2] == (4, 4)
+    # the power-of-two exception is keyed on the contraction and M, not on the direction
+    assert select_int8_config(4112, 4096, 4096, False)[0:2] == (2, 4)
+    assert select_int8_config(4112, 4096, 4096, True)[0:2] == (2, 4)
+    assert select_int8_config(9232, 4096, 4096, False)[0:2] == (4, 4)
+    assert select_int8_config(9232, 4096, 4096, True)[0:2] == (4, 4)
 
 
 # activation quantizer (ConvRot producer)
