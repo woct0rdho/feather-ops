@@ -219,6 +219,67 @@ def test_quantize_matches_the_reference_recipe(dtype, rotate, shape):
     assert ((scale - ref_scale).abs() / ref_scale.abs()).max().item() < 1e-2
 
 
+# Every group-256 activation width a ConvRot step produces across the models and shapes of
+# docs/int8_convrot_prepacked_fwd_bwd_plan.md. A step quantizes both the weight's input axis (forward) and its
+# output axis (input gradient), so both the K and the N of each (N, K) family appear here. 16384 is the last row
+# small enough to be staged in LDS next to a full block of waves. Above that the kernel streams it instead.
+PLAN_PRODUCER_WIDTHS = [
+    1024,  # Anima mlp
+    2048,  # Anima self-attn / mlp
+    3072,  # MOSS-Image
+    3840,  # Z-Image
+    4096,  # Qwen-Image 2.1 / Klein 9B / Qwen3.5-9B text encoder
+    5120,  # Qwen3-VL-32B text encoder
+    5376,  # H3
+    6144,  # Krea 2
+    7168,  # H3
+    8192,  # Anima / MOSS-Image / Qwen3-VL-32B text encoder
+    10240,  # Z-Image
+    11520,  # Z-Image
+    12288,  # Qwen-Image 2.1 / Klein 9B
+    14336,  # H3
+    16384,  # Krea 2 / MOSS-Image / Klein 9B (last staged row)
+    21504,  # H3
+    24576,  # Qwen-Image 2.1 / Klein 9B
+    25600,  # Qwen3-VL-32B text encoder
+    28672,  # H3
+    36864,  # Klein 9B
+    248320,  # Qwen3.5-9B text encoder vocab projection
+]
+
+
+@pytest.mark.parametrize("K", PLAN_PRODUCER_WIDTHS)
+@pytest.mark.parametrize("rotate", [True, False])
+def test_quantize_every_plan_width(K, rotate):
+    """The producer covers every width the plan's models run, streamed or staged, with the reference codes."""
+    M = 3
+    torch.manual_seed(K)
+    x = (torch.randn(M, K, device=DEV, dtype=torch.float32) * 2.0).to(torch.bfloat16)
+    q, scale = convrot_quantize_activation(x, rotate=rotate)
+    ref_q, ref_scale = _reference_quantize(x, rotate)
+    dq = q.float() * scale[:, None]
+    ref_dq = ref_q.float() * ref_scale[:, None]
+    assert ((dq - ref_dq).norm() / ref_dq.norm()).item() < 1e-3
+    assert (q != ref_q).float().mean().item() < 1e-3
+    assert ((scale - ref_scale).abs() / ref_scale.abs()).max().item() < 1e-2
+
+
+@pytest.mark.parametrize("K", [16384, 16640, 32768, 248320])  # 16384 is the staging threshold
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_quantize_wide_rows_fold_the_column_scale(K, dtype):
+    """The input gradient's producer (no rotation, weight scale folded in) on the wide rows."""
+    M = 5
+    torch.manual_seed(K)
+    x = (torch.randn(M, K, device=DEV, dtype=torch.float32) * 2.0).to(dtype)
+    col_scale = (torch.rand(K, device=DEV, dtype=torch.float32) * 0.5 + 0.5).to(torch.float32)
+    q, scale = convrot_quantize_activation(x, rotate=False, col_scale=col_scale)
+    ref_q, ref_scale = _reference_quantize(x, False, col_scale)
+    dq = q.float() * scale[:, None]
+    ref_dq = ref_q.float() * ref_scale[:, None]
+    assert ((dq - ref_dq).norm() / ref_dq.norm()).item() < 1e-3
+    assert (q != ref_q).float().mean().item() < 1e-3
+
+
 def test_quantize_folds_the_column_scale():
     """The gradient path folds the weight's per-output-channel scale into the quantizer."""
     M, K = 512, 2048

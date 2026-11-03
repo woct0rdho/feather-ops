@@ -738,13 +738,45 @@ __device__ __forceinline__ float as_input_rounded(const float v) {
     }
 }
 
+// Produce one 256-value group into a wave's fp32 LDS slot: load it (folding the per-column scale when the
+// rotation is off), then, for the forward, run the four radix-4 Hadamard stages. The staged row and the
+// wide-row streaming path both call this, so both apply exactly the same arithmetic to the same inputs.
+template <bool kInputFp16>
+__device__ __forceinline__ void produce_group(
+    const uint16_t* __restrict__ x_row,
+    const float* __restrict__ col_scale,
+    float* const slot,
+    const int g,
+    const int lane,
+    const int rotate)
+{
+    const int base = lane * kQuantPerLane;
+#pragma unroll
+    for (int i = 0; i < kQuantPerLane; ++i) {
+        float value = input_bits_to_float<kInputFp16>(x_row[g + base + i]);
+        if (!rotate && col_scale != nullptr) value = as_input_rounded<kInputFp16>(value * col_scale[g + base + i]);
+        slot[base + i] = value;
+    }
+    if (rotate) {
+        radix4_stage(slot, 0, 0, lane);
+        radix4_stage(slot, 0, 2, lane);
+        radix4_stage(slot, 0, 4, lane);
+        radix4_stage(slot, 0, 6, lane);
+    }
+}
+
 // One row per block. The row's 256-value groups are spread over the block's waves (one group per wave per
 // round), so the block is as wide as the row and its LDS footprint is (K bf16 of finished values) plus one
 // fp32 group slot per wave. The fp32 slot is what the radix-4 stages work in - rounding after each stage
 // would cost four mantissa roundings instead of the single one the reference recipe applies - and the
 // finished group is rounded into the bf16 row, which is where the max and the quantize pass read it from.
 // A group's rotation stays inside its own wave (no barrier). The row absmax is the block's only reduction.
-template <bool kInputFp16>
+//
+// kStageRow=false is the wide-row path (K > 16384, up to the 248320-wide Vocab projection of a 32B text
+// encoder): the finished row would no longer leave room for a full block of waves in LDS, so the quantize
+// pass recomputes each group from global memory (L2-hot) instead, which keeps 32 waves and 4 workgroups per
+// WGP. The scale and the codes are identical to the staged path because both use the same producer.
+template <bool kInputFp16, bool kStageRow>
 __global__ void convrot_quantize_kernel(
     const uint16_t* __restrict__ x,       // [M, K] bf16 or fp16
     const float* __restrict__ col_scale,  // [K] or null: per-contraction-column multiplier (the weight scale fold)
@@ -759,31 +791,22 @@ __global__ void convrot_quantize_kernel(
     const int wave = static_cast<int>(threadIdx.x) / kWaveSize;
     const int waves = static_cast<int>(blockDim.x) / kWaveSize;
     const int64_t row = blockIdx.x;
-    float* const group_slot = smem;                                  // waves * 256 floats
-    uint16_t* const row_vals = reinterpret_cast<uint16_t*>(smem + waves * kQuantGroup);  // K bf16
+    float* const group_slot = smem;  // waves * 256 floats
+    // The staged path keeps the finished (rotated, rounded) row for the quantize pass. The wide-row path
+    // has no row buffer and recomputes each group from x instead.
+    uint16_t* const row_vals = kStageRow ? reinterpret_cast<uint16_t*>(smem + waves * kQuantGroup) : nullptr;
 
     const uint16_t* const x_row = x + row * K;
+    const int lane_base = lane * kQuantPerLane;
     float vmax = 0.0f;
     for (int gidx = wave; gidx < groups_per_row; gidx += waves) {
-        const int base = lane * kQuantPerLane;
-        float* const slot = group_slot + wave * kQuantGroup;
         const int g = gidx * kQuantGroup;
+        float* const slot = group_slot + wave * kQuantGroup;
+        produce_group<kInputFp16>(x_row, col_scale, slot, g, lane, rotate);
 #pragma unroll
         for (int i = 0; i < kQuantPerLane; ++i) {
-            float value = input_bits_to_float<kInputFp16>(x_row[g + base + i]);
-            if (!rotate && col_scale != nullptr) value = as_input_rounded<kInputFp16>(value * col_scale[g + base + i]);
-            slot[base + i] = value;
-        }
-        if (rotate) {
-            radix4_stage(slot, 0, 0, lane);
-            radix4_stage(slot, 0, 2, lane);
-            radix4_stage(slot, 0, 4, lane);
-            radix4_stage(slot, 0, 6, lane);
-        }
-#pragma unroll
-        for (int i = 0; i < kQuantPerLane; ++i) {
-            const uint16_t bits = float_to_bits<kInputFp16>(slot[base + i]);
-            row_vals[g + base + i] = bits;
+            const uint16_t bits = float_to_bits<kInputFp16>(slot[lane_base + i]);
+            if constexpr (kStageRow) row_vals[g + lane_base + i] = bits;
             vmax = fmaxf(vmax, fabsf(input_bits_to_float<kInputFp16>(bits)));
         }
     }
@@ -807,11 +830,22 @@ __global__ void convrot_quantize_kernel(
 
     int8_t* const q_row = q + row * K;
     for (int gidx = wave; gidx < groups_per_row; gidx += waves) {
-        const int base = gidx * kQuantGroup + lane * kQuantPerLane;
+        const int g = gidx * kQuantGroup;
+        const int base = g + lane_base;
+        float* const slot = group_slot + wave * kQuantGroup;
         float v[kQuantPerLane];
+        if constexpr (kStageRow) {
 #pragma unroll
-        for (int i = 0; i < kQuantPerLane; ++i) {
-            v[i] = input_bits_to_float<kInputFp16>(row_vals[base + i]);
+            for (int i = 0; i < kQuantPerLane; ++i) {
+                v[i] = input_bits_to_float<kInputFp16>(row_vals[base + i]);
+            }
+        } else {
+            // no row buffer to read back: recompute the group (x is L2-hot here)
+            produce_group<kInputFp16>(x_row, col_scale, slot, g, lane, rotate);
+#pragma unroll
+            for (int i = 0; i < kQuantPerLane; ++i) {
+                v[i] = input_bits_to_float<kInputFp16>(float_to_bits<kInputFp16>(slot[lane_base + i]));
+            }
         }
         uint32_t packed[2];
 #pragma unroll
@@ -837,30 +871,52 @@ extern "C" bool launch_convrot_quantize(
 {
     if (K % kQuantGroup != 0) return false;
     const int64_t groups_per_row = K / kQuantGroup;
-    // one wave per group, capped by a full workgroup and by the LDS budget above ~32 KB of footprint
+    // LDS budget: gfx11 allows 64 KB per workgroup (a WGP holds two such workgroups), minus the kernel's
+    // static shared memory (the per-wave maxima) and alignment slack. Staging the whole finished row costs
+    // K * 2 bytes, which only leaves a full block of waves while K <= 16384. Above that the quantize pass
+    // recomputes each group from global memory instead, so any K works without a per-workgroup limit.
+    constexpr int64_t kWorkgroupLdsBytes = 65536;
+    constexpr int64_t kStaticLdsBytes = 256;
+    constexpr int64_t kMaxStagedRowBytes = 32768;
+    const bool stage_row = K * static_cast<int64_t>(sizeof(uint16_t)) <= kMaxStagedRowBytes;
     int64_t waves = groups_per_row < 32 ? groups_per_row : 32;
-    const int64_t lds_budget_waves = (32768 - K * static_cast<int64_t>(sizeof(uint16_t))) / (kQuantGroup * static_cast<int64_t>(sizeof(float)));
-    if (waves > lds_budget_waves) waves = lds_budget_waves;
+    if (stage_row) {
+        // the previous budget (32 KB of total footprint) collapsed K >= 16384 to a single wave, i.e. 32 threads
+        // and 33 KB of LDS per block. The row now uses half the workgroup LDS, so a block always has >= 31 waves
+        const int64_t budget_waves = (kWorkgroupLdsBytes - kStaticLdsBytes - K * static_cast<int64_t>(sizeof(uint16_t))) /
+                                     (kQuantGroup * static_cast<int64_t>(sizeof(float)));
+        if (waves > budget_waves) waves = budget_waves;
+    }
     if (waves < 1) waves = 1;
-    const size_t smem = static_cast<size_t>(waves) * kQuantGroup * sizeof(float) + static_cast<size_t>(K) * sizeof(uint16_t);
-    if (smem > 65536) return false;
+    const size_t smem = static_cast<size_t>(waves) * kQuantGroup * sizeof(float) +
+                        (stage_row ? static_cast<size_t>(K) * sizeof(uint16_t) : 0);
+    if (smem > static_cast<size_t>(kWorkgroupLdsBytes - kStaticLdsBytes)) return false;
     const dim3 block(static_cast<uint32_t>(kWaveSize * waves), 1, 1);
     const dim3 grid(static_cast<uint32_t>(M), 1, 1);
     const uint16_t* const xp = static_cast<const uint16_t*>(x);
-    const auto launch = [&](auto tag) {
-        constexpr bool kFp16 = decltype(tag)::value;
-        const void* const fn = reinterpret_cast<const void*>(&convrot_quantize_kernel<kFp16>);
+    const auto launch = [&](auto fp16_tag, auto stage_tag) {
+        constexpr bool kFp16 = decltype(fp16_tag)::value;
+        constexpr bool kStage = decltype(stage_tag)::value;
+        const void* const fn = reinterpret_cast<const void*>(&convrot_quantize_kernel<kFp16, kStage>);
         if (smem > 48 * 1024) {
             (void)hipFuncSetAttribute(fn, hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
         }
         hipLaunchKernelGGL(
-            (convrot_quantize_kernel<kFp16>), grid, block, smem, stream,
+            (convrot_quantize_kernel<kFp16, kStage>), grid, block, smem, stream,
             xp, col_scale, q, row_scale, static_cast<int>(K), static_cast<int>(groups_per_row), rotate);
     };
     if (input_fp16) {
-        launch(std::integral_constant<bool, true>{});
+        if (stage_row) {
+            launch(std::integral_constant<bool, true>{}, std::integral_constant<bool, true>{});
+        } else {
+            launch(std::integral_constant<bool, true>{}, std::integral_constant<bool, false>{});
+        }
     } else {
-        launch(std::integral_constant<bool, false>{});
+        if (stage_row) {
+            launch(std::integral_constant<bool, false>{}, std::integral_constant<bool, true>{});
+        } else {
+            launch(std::integral_constant<bool, false>{}, std::integral_constant<bool, false>{});
+        }
     }
     return hipGetLastError() == hipSuccess;
 }
