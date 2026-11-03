@@ -37,6 +37,8 @@ CELLS = [
     ("krea2-musubi", [(2560, 6144, 6144), (4352, 6144, 6144), (4352, 1536, 6144), (4352, 16384, 6144), (4352, 6144, 16384), (9472, 16384, 6144)]),  # M padded to 256
     ("h3-ragged", [(5251, 21504, 5376), (25343, 21504, 5376)]),  # video+audio+text rows are not 256-aligned
     ("text-enc-short", [(32, 25600, 5120), (32, 5120, 25600), (128, 1024, 5120), (128, 8192, 5120)]),  # short prompts
+    # the small-M tiers: TE at 192/256 tokens (the 64x64 tile's crossover is on the output width, not M)
+    ("text-enc-192", [(192, 2560, 2560), (192, 12288, 4096), (256, 12288, 4096), (256, 4096, 4096)]),
 ]
 
 DEV = "cuda"

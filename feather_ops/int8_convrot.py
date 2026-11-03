@@ -45,7 +45,7 @@ def _block_sizes(cfg: tuple[int, int, int, int, int]) -> tuple[int, int, int]:
 
 
 # Tile schedule per role, measured on the model cells of the int8 ConvRot plan (bench/benchmark_int8_convrot.py).
-_TILE_SMALL_M = (2, 2, 2, 2, 2)  # 64x64, 128 threads: 1-128 rows (prefix passes, cross-attn at 512 rows)
+_TILE_SMALL_M = (2, 2, 2, 2, 2)  # 64x64, 128 threads: 1-256 rows (prefix passes, short text rows)
 _TILE_NARROW = (4, 2, 2, 4, 4)  # 256x128, 256 threads: narrow outputs, where a 256-wide tile is mostly tail
 _TILE_WIDE = (4, 4, 2, 4, 4)  # 256x256, 512 threads: wide outputs, the bulk of the model flops
 _TILE_MID = (2, 4, 2, 4, 2)  # 128x128, 256 threads: everything else
@@ -61,8 +61,17 @@ def select_int8_config(M: int, N: int, K: int, transposed_b: bool) -> tuple[int,
     """
     out = K if transposed_b else N
     contraction = N if transposed_b else K
-    if M <= 128:
+    # Small M. A 128-row tile splits into a full launch plus a 64-row tail launch - two single-wave grids -
+    # and at this size the per-CTA fill/drain is what dominates, so one 64x64 launch wins until the output is
+    # wide enough for the 128x128 tile's larger N panel to amortize (measured crossover at `out ~ 4096` for
+    # M = 192-256 and `out ~ 8192` for M = 128. M <= 64 keeps 64x64 up to 24576, and M >= 384 is back on the
+    # 128-row tile). Above the crossover the 256x256 tile is 1.1-2.2x worse, so the answer there is 128x128.
+    if M <= 64:
         return _TILE_SMALL_M
+    if M <= 128:
+        return _TILE_SMALL_M if out <= 8192 else _TILE_MID
+    if M <= 256:
+        return _TILE_SMALL_M if out <= 4096 else _TILE_MID
     if out <= 1280 and M >= 1024:
         # narrow output: a 256-wide tile is mostly tail, but it needs enough M tile rows to fill the CUs
         return _TILE_NARROW
@@ -72,10 +81,11 @@ def select_int8_config(M: int, N: int, K: int, transposed_b: bool) -> tuple[int,
         # mid-width output: the 256x256 tile halves the number of A panels, which is what the cells with a real
         # reduction axis want in both directions (measured +3.4% to +7.9% over 128x128 on Z-Image 3840x*, H3's
         # out_proj/fc2 5376x*, MOSS 3072x*, and the gradients of the same families).
-        # Exception: a power-of-two contraction up to 8192 at a small M aliases the L2 sets with a 256-wide
+        # Exception: a power-of-two contraction up to 8192 at a mid-size M aliases the L2 sets with a 256-wide
         # tile (Qwen-Image / Klein 4096x4096 at M=4112 is 3.5% faster on 128x128 while M=9232 prefers 256x256.
-        # A 16384-wide contraction at the same M prefers 256x256, so the exception stops at 8192).
-        if 4096 <= contraction <= 8192 and (contraction & (contraction - 1)) == 0 and M < 8192:
+        # A 16384-wide contraction at the same M prefers 256x256, so the exception stops at 8192, and at
+        # M = 512 the wide tile wins by 22-29%, so it starts at 1024).
+        if 4096 <= contraction <= 8192 and (contraction & (contraction - 1)) == 0 and 1024 <= M < 8192:
             return _TILE_MID
         return _TILE_WIDE
     if out < 2048 and contraction >= 4096:
