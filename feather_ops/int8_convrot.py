@@ -38,12 +38,6 @@ INT8_CONFIGS: list[tuple[int, int, int, int, int]] = [
 ]
 
 
-def _block_sizes(cfg: tuple[int, int, int, int, int]) -> tuple[int, int, int]:
-    """(block_m, block_n, chunk_k) of a config tuple."""
-    warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
-    return 16 * warps_m * repeat_m, 16 * warps_n * repeat_n, 16 * unroll_k
-
-
 # Tile schedule per role, measured on the model cells of the int8 ConvRot plan (bench/benchmark_int8_convrot.py).
 _TILE_SMALL_M = (2, 2, 2, 2, 2)  # 64x64, 128 threads: 1-256 rows (prefix passes, short text rows)
 _TILE_NARROW = (4, 2, 2, 4, 4)  # 256x128, 256 threads: narrow outputs, where a 256-wide tile is mostly tail
@@ -63,9 +57,9 @@ def select_int8_config(M: int, N: int, K: int, transposed_b: bool) -> tuple[int,
     contraction = N if transposed_b else K
     # Small M. A 128-row tile splits into a full launch plus a 64-row tail launch - two single-wave grids -
     # and at this size the per-CTA fill/drain is what dominates, so one 64x64 launch wins until the output is
-    # wide enough for the 128x128 tile's larger N panel to amortize (measured crossover at `out ~ 4096` for
+    # wide enough for the 128x128 tile's larger N panel to amortize (the crossover sits at `out ~ 4096` for
     # M = 192-256 and `out ~ 8192` for M = 128. M <= 64 keeps 64x64 up to 24576, and M >= 384 is back on the
-    # 128-row tile). Above the crossover the 256x256 tile is 1.1-2.2x worse, so the answer there is 128x128.
+    # 128-row tile). Above the crossover the 256x256 tile loses, so the answer there is 128x128.
     if M <= 64:
         return _TILE_SMALL_M
     if M <= 128:
@@ -79,12 +73,12 @@ def select_int8_config(M: int, N: int, K: int, transposed_b: bool) -> tuple[int,
         return _TILE_WIDE
     if out >= 3072 and contraction >= 2048:
         # mid-width output: the 256x256 tile halves the number of A panels, which is what the cells with a real
-        # reduction axis want in both directions (measured +3.4% to +7.9% over 128x128 on Z-Image 3840x*, H3's
-        # out_proj/fc2 5376x*, MOSS 3072x*, and the gradients of the same families).
+        # reduction axis want in both directions (Z-Image 3840x*, H3's out_proj/fc2 5376x*, MOSS 3072x*, and the
+        # gradients of the same families).
         # Exception: a power-of-two contraction up to 8192 at a mid-size M aliases the L2 sets with a 256-wide
-        # tile (Qwen-Image / Klein 4096x4096 at M=4112 is 3.5% faster on 128x128 while M=9232 prefers 256x256.
-        # A 16384-wide contraction at the same M prefers 256x256, so the exception stops at 8192, and at
-        # M = 512 the wide tile wins by 22-29%, so it starts at 1024).
+        # tile (Qwen-Image / Klein 4096x4096 at M=4112 prefers 128x128 while M=9232 prefers 256x256. A
+        # 16384-wide contraction at the same M prefers 256x256, so the exception stops at 8192, and at
+        # M = 512 the wide tile wins, so it starts at 1024).
         if 4096 <= contraction <= 8192 and (contraction & (contraction - 1)) == 0 and 1024 <= M < 8192:
             return _TILE_MID
         return _TILE_WIDE
@@ -136,19 +130,14 @@ def convrot_quantize_activation(
         `(q int8 [M, K], scale float32 [M])`. `scale` is of the normalized rotated values, so a consumer
         dequantizes with `q * scale` exactly as for the weight path.
     """
-    if x.dim() != 2 or x.dtype not in (torch.bfloat16, torch.float16) or not x.is_contiguous():
-        raise ValueError("x must be a contiguous 2D bfloat16/float16 tensor")
-    M, K = x.shape
-    if K % 256 != 0:
-        raise ValueError(f"K must be a multiple of the ConvRot group size (256), got {K}")
-    q = torch.empty((M, K), device=x.device, dtype=torch.int8)
-    scale = torch.empty(M, device=x.device, dtype=torch.float32)
+    q = torch.empty(x.shape, device=x.device, dtype=torch.int8)
+    scale = torch.empty(x.shape[0], device=x.device, dtype=torch.float32)
     torch.ops.feather_ops.convrot_quantize.default(
         x,
         None if col_scale is None else col_scale.reshape(-1).to(device=x.device, dtype=torch.float32),
         q,
         scale,
-        1 if rotate else 0,
+        rotate,
     )
     return q, scale
 
@@ -180,15 +169,12 @@ def int8_scaled_mm(
     Returns:
         `[M, N_out]` in `out_dtype`.
     """
-    if a.dim() != 2 or a.dtype != torch.int8 or not a.is_contiguous():
-        raise ValueError("a must be a contiguous 2D int8 tensor")
-    if out_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"out_dtype must be bfloat16 or float16, got {out_dtype}")
-    M, K = a.shape
-    weight_elems = weight_prepacked.numel()
-    if K == 0 or weight_elems % K != 0:
-        raise ValueError("prepacked weight size must be divisible by the contraction axis")
-    n_out = weight_elems // K
+    M, K = a.shape[0], a.shape[1]
+    # `n_out` is derived from K here, so K must be usable as a divisor. Everything else the C++ op
+    # validates (2-D, dtypes, contiguity, the weight's extent, the output layout).
+    if K == 0:
+        raise ValueError("a must have a nonzero contraction axis")
+    n_out = weight_prepacked.numel() // K
     if transposed_b and weight_scale is not None:
         raise ValueError("transposed_b folds the weight scale into the activation quantization, so weight_scale must be None")
 
@@ -201,7 +187,7 @@ def int8_scaled_mm(
         None if weight_scale is None else weight_scale.reshape(-1).to(torch.float32),
         bias,
         out,
-        1 if transposed_b else 0,
+        transposed_b,
         *cfg,
     )
     return out

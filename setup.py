@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "csrc"
 SOURCES = [
     "csrc/extension.cpp",
+    "csrc/hip_conv2d_3x3.cu",
     "csrc/hip_kernel.cu",
     "csrc/hip_kernel_fp16.cu",
     "csrc/hip_kernel_int8.cu",
@@ -64,6 +65,8 @@ rocm_include_dir = rocm_devel_root / "include"
 include_dirs = [str(CSRC), str(rocm_include_dir)]
 rocm_lib_dirs = [str(rocm_devel_root / "lib")]
 
+# The hipBLASLt kernels are for experiments and not exported in the public API of feather-ops.
+# If you only need to use the public API, then it's optional to build the hipBLASLt kernels.
 libraries = []
 extra_link_args = []
 if os.name == "nt":

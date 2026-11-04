@@ -31,7 +31,6 @@ def _configured_op(
         unroll_k,
         repeat_m,
         repeat_n,
-        0 if b_prepacked.dtype == torch.float8_e4m3fn else 1,
     )
     return out
 

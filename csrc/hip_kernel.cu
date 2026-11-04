@@ -470,7 +470,7 @@ void launch_scaled_mm_configured(
     const int64_t K,
     const int has_scale,
     const int has_bias,
-    const int b_dtype,
+    const bool use_fp8_e5m2,
     const int output_dtype,
     hipStream_t stream)
 {
@@ -488,7 +488,6 @@ void launch_scaled_mm_configured(
     const dim3 block(kThreadsPerBlock, 1, 1);
     const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
 
-    const bool use_fp8_e5m2 = (b_dtype == 1);
     const bool use_fp16_output = (output_dtype == 0);
     if (enable_a_wsgr) {
         if (use_fp8_e5m2) {
@@ -577,7 +576,7 @@ extern "C" bool launch_scaled_mm(
     const int unroll_k,
     const int repeat_m,
     const int repeat_n,
-    const int b_dtype,
+    const bool use_fp8_e5m2,
     const int output_dtype,
     hipStream_t stream)
 {
@@ -591,7 +590,7 @@ extern "C" bool launch_scaled_mm(
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
                 has_scale, has_bias,
-                b_dtype, output_dtype, stream);
+                use_fp8_e5m2, output_dtype, stream);
             return true;
         }
         return false;
@@ -642,8 +641,7 @@ void scaled_mm(
     const int64_t block_warps_n,
     const int64_t unroll_k,
     const int64_t repeat_m,
-    const int64_t repeat_n,
-    const int64_t b_dtype)
+    const int64_t repeat_n)
 {
     STD_TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
     STD_TORCH_CHECK(b_prepacked.is_cuda(), "b_prepacked must be a CUDA tensor");
@@ -653,13 +651,12 @@ void scaled_mm(
     STD_TORCH_CHECK(c.get_device_index() == device_index, "c must be on the same device as a");
 
     STD_TORCH_CHECK(a.scalar_type() == torch::stable::ScalarType::Half, "a must be float16");
-    STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::Half || c.scalar_type() == torch::stable::ScalarType::BFloat16, "c must be float16 or bfloat16");
-    STD_TORCH_CHECK(b_dtype == 0 || b_dtype == 1, "b_dtype must be 0 (fp8e4m3) or 1 (fp8e5m2)");
-    if (b_dtype == 0) {
-        STD_TORCH_CHECK(b_prepacked.scalar_type() == torch::stable::ScalarType::Float8_e4m3fn, "b_prepacked must be float8_e4m3fn when b_dtype=0");
-    } else {
-        STD_TORCH_CHECK(b_prepacked.scalar_type() == torch::stable::ScalarType::Float8_e5m2, "b_prepacked must be float8_e5m2 when b_dtype=1");
-    }
+    STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::Half || c.scalar_type() == torch::stable::ScalarType::BFloat16,
+                    "c must be float16 or bfloat16");
+    const auto b_scalar_type = b_prepacked.scalar_type();
+    STD_TORCH_CHECK(b_scalar_type == torch::stable::ScalarType::Float8_e4m3fn || b_scalar_type == torch::stable::ScalarType::Float8_e5m2,
+                    "b_prepacked must be float8_e4m3fn or float8_e5m2");
+    const bool use_fp8_e5m2 = b_scalar_type == torch::stable::ScalarType::Float8_e5m2;
 
     STD_TORCH_CHECK(a.dim() == 2, "a must be 2D");
     STD_TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D (K/16, N, 16)");
@@ -736,7 +733,7 @@ void scaled_mm(
         M, N, K,
         scale.has_value() ? 1 : 0, bias.has_value() ? 1 : 0,
         block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n,
-        b_dtype, output_dtype, stream);
+        use_fp8_e5m2, output_dtype, stream);
     STD_TORCH_CHECK(launched, "Unsupported config");
 
     const hipError_t launch_err = hipGetLastError();
@@ -756,8 +753,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(feather_ops, m)
         "int block_warps_n, "
         "int unroll_k, "
         "int repeat_m, "
-        "int repeat_n, "
-        "int b_dtype"
+        "int repeat_n"
         ") -> ()");
 }
 

@@ -109,18 +109,18 @@ def main():
                     results[cfg] = (ms, tflops)
                 ranked = sorted(results.items(), key=lambda kv: kv[1][0])
                 if args.verbose:
-                    detail = "  ".join(f"{cfg[0]}x{cfg[1]}r{cfg[3]}x{cfg[4]}u{cfg[2]}={tf:5.1f}" for cfg, (_ms, tf) in ranked)
+                    detail = "  ".join(f"{cfg[0]}x{cfg[1]}r{cfg[3]}x{cfg[4]}u{cfg[2]}={tf:.3f}" for cfg, (_ms, tf) in ranked)
                     print(f"# {name} {'bwd' if transposed_b else 'fwd'} {M}x{N_w}x{K_w}: {detail}", flush=True)
                 best_cfg, (best_ms, best_tf) = ranked[0]
                 if len(ranked) > 1:
                     second_cfg, (second_ms, _) = ranked[1]
-                    second_txt = f"{second_cfg!s:22s} {second_ms / best_ms:6.3f}"
+                    second_txt = f"{second_cfg!s:22s} {second_ms / best_ms:.3f}"
                 else:
                     second_txt = f"{'-':22s} {'-':>6s}"
-                line = f"{name:10s} {'bwd' if transposed_b else 'fwd':4s} {M:6d} {N_w:6d} {K_w:6d} {best_cfg!s:22s} {best_ms:8.3f} {best_tf:7.1f} {second_txt}"
+                line = f"{name:10s} {'bwd' if transposed_b else 'fwd':4s} {M:6d} {N_w:6d} {K_w:6d} {best_cfg!s:22s} {best_ms:.3f} {best_tf:.3f} {second_txt}"
                 if args.bf16:
                     bf_ms, bf_tf = bf16_reference(M, N_w, K_w, transposed_b)
-                    line += f"  {bf_tf:7.1f}  {bf_ms / best_ms:6.2f}x"
+                    line += f"  {bf_tf:.3f}  {bf_ms / best_ms:.3f}x"
                 print(line, flush=True)
 
 

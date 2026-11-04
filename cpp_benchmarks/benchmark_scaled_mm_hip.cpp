@@ -40,7 +40,7 @@ extern "C" bool launch_scaled_mm(
     const int unroll_k,
     const int repeat_m,
     const int repeat_n,
-    const int b_dtype,
+    const bool use_fp8_e5m2,
     const int output_dtype,
     hipStream_t stream);
 
@@ -205,7 +205,7 @@ int main(int argc, char** argv)
             opts.m, opts.n, opts.k,
             1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
-            1, // b_dtype=1 (fp8e5m2)
+            true, // use_fp8_e5m2
             0, // output_dtype=0 (fp16)
             stream
         );
@@ -230,7 +230,7 @@ int main(int argc, char** argv)
             opts.m, opts.n, opts.k,
             1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
-            1, // b_dtype=1 (fp8e5m2)
+            true, // use_fp8_e5m2
             0, // output_dtype=0 (fp16)
             stream
         );

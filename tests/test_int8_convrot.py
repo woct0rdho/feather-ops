@@ -349,7 +349,7 @@ def test_quantize_folds_the_column_scale():
 
 def test_quantize_rejects_a_non_multiple_of_the_group_size():
     x = torch.zeros(4, 384, device=DEV, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="multiple of the ConvRot group size"):
+    with pytest.raises(RuntimeError, match="multiple of the ConvRot group size"):
         convrot_quantize_activation(x)
 
 

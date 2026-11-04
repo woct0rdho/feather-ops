@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "feather-ops"
 version = "0.1.0"
-description = "Fast quantized matmul kernels for RDNA3/3.5"
+description = "Fast matmul/conv kernels for RDNA3/3.5"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"

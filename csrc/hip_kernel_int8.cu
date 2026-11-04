@@ -420,7 +420,7 @@ extern "C" bool launch_int8_scaled_mm(
     const int64_t K_contract,
     const int64_t b_stride_kc,
     const int64_t b_stride_out,
-    const int transposed_b,
+    const bool transposed_b,
     const int block_warps_m,
     const int block_warps_n,
     const int unroll_k,
@@ -442,7 +442,7 @@ extern "C" bool launch_int8_scaled_mm(
     };
     const auto try_launch_one = [&](auto tag, const int64_t m_base, const int64_t rows) -> bool {
         if (block_warps_m == decltype(tag)::kBlockWarpsM && block_warps_n == decltype(tag)::kBlockWarpsN && unroll_k == decltype(tag)::kUnrollK &&
-            repeat_m == decltype(tag)::kRepeatM && repeat_n == decltype(tag)::kRepeatN && (transposed_b != 0) == decltype(tag)::kTransposedB) {
+            repeat_m == decltype(tag)::kRepeatM && repeat_n == decltype(tag)::kRepeatN && transposed_b == decltype(tag)::kTransposedB) {
             launch_tag(tag, m_base, rows);
             return true;
         }
@@ -519,7 +519,7 @@ void int8_scaled_mm(
     const std::optional<torch::stable::Tensor>& b_scale,
     const std::optional<torch::stable::Tensor>& bias,
     torch::stable::Tensor& c,
-    const int64_t transposed_b,
+    const bool transposed_b,
     const int64_t block_warps_m,
     const int64_t block_warps_n,
     const int64_t unroll_k,
@@ -588,7 +588,7 @@ void int8_scaled_mm(
         K_contract,
         b_stride_kc,
         b_stride_out,
-        static_cast<int>(transposed_b),
+        transposed_b,
         static_cast<int>(block_warps_m),
         static_cast<int>(block_warps_n),
         static_cast<int>(unroll_k),
@@ -612,7 +612,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(feather_ops, m)
         "Tensor? b_scale, "
         "Tensor? bias, "
         "Tensor(a!) c, "
-        "int transposed_b, "
+        "bool transposed_b, "
         "int block_warps_m, "
         "int block_warps_n, "
         "int unroll_k, "
@@ -794,7 +794,7 @@ __device__ __forceinline__ void produce_group(
     float (&v)[kQuantPerLane],
     const int g,
     const int lane,
-    const int rotate)
+    const bool rotate)
 {
     const int base = lane * kQuantPerLane;
 #pragma unroll
@@ -825,7 +825,7 @@ __global__ void convrot_quantize_kernel(
     float* __restrict__ row_scale,        // [M] output scale
     const int K,
     const int groups_per_row,             // K / 256
-    const int rotate)
+    const bool rotate)
 {
     extern __shared__ __align__(16) float smem[];
     const int lane = static_cast<int>(threadIdx.x) % kWaveSize;
@@ -915,7 +915,7 @@ extern "C" bool launch_convrot_quantize(
     const int64_t M,
     const int64_t K,
     const int input_fp16,
-    const int rotate,
+    const bool rotate,
     hipStream_t stream)
 {
     if (K % kQuantGroup != 0) return false;
@@ -970,7 +970,7 @@ void convrot_quantize(
     const std::optional<torch::stable::Tensor>& col_scale,
     torch::stable::Tensor& q,
     torch::stable::Tensor& row_scale,
-    const int64_t rotate)
+    const bool rotate)
 {
     STD_TORCH_CHECK(x.is_cuda() && q.is_cuda() && row_scale.is_cuda(), "tensors must be CUDA tensors");
     STD_TORCH_CHECK(x.dim() == 2, "x must be 2D");
@@ -1005,14 +1005,14 @@ void convrot_quantize(
         M,
         K,
         x.scalar_type() == torch::stable::ScalarType::Half ? 1 : 0,
-        static_cast<int>(rotate),
+        rotate,
         stream);
     STD_TORCH_CHECK(ok, "convrot_quantize launch failed: ", hipGetErrorString(hipGetLastError()));
 }
 
 STABLE_TORCH_LIBRARY_FRAGMENT(feather_ops, m)
 {
-    m.def("convrot_quantize(Tensor x, Tensor? col_scale, Tensor(a!) q, Tensor(b!) row_scale, int rotate) -> ()");
+    m.def("convrot_quantize(Tensor x, Tensor? col_scale, Tensor(a!) q, Tensor(b!) row_scale, bool rotate) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(feather_ops, CUDA, m)
