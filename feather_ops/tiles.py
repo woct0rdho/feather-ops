@@ -131,5 +131,12 @@ def conv_block_sizes(tile: tuple[int, ...]) -> tuple[int, int, int]:
     return 16 * warps_m * repeat_m, 16 * warps_n * repeat_n, rows
 
 
+# Above this many input elements, MIOpen's fp16 Winograd stops winning on shapes the kernel tiles and the
+# kernel takes over (measured: 0.98x at 384->384 1024^2, 0.97x at 128->128 2048^2).
 MIOPEN_FP16_MAX_INPUT_ELEMS = 1 << 28
+# Shapes the kernel has no tile for fall back to im2col, which is 2-10x slower than MIOpen on them, so they
+# are delegated while MIOpen holds that lead. fp16 keeps it at every size measured. bf16 has no Winograd and
+# its implicit-GEMM path collapses past about a billion input elements (96->3 at 3584^2: 903 ms against
+# im2col's 226), so bf16 keeps this cap.
+MIOPEN_BF16_FALLBACK_MAX_INPUT_ELEMS = 1 << 30
 CONV_PREFETCH_MIN_C_IN = 128

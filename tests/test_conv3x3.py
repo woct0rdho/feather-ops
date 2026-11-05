@@ -71,13 +71,12 @@ def test_conv3x3_matches_reference(dtype, c_in, c_out, h, w, with_bias):
     assert rel < tol, f"rel={rel} for {dtype} {c_in}->{c_out} {h}x{w}"
 
 
-# C_out that no tile divides (40 = 8 * 5) is outside the kernel's contract: the dispatch must say so and
-# `conv2d` must still be a drop-in for `F.conv2d` through the documented fallback.
+# C_out that no tile divides (40 = 8 * 5) is outside the kernel's contract: the dispatch must say so, the
+# shape is delegated to MIOpen (im2col is 2-10x slower on it), and `conv2d` must still be a drop-in.
 @pytest.mark.parametrize(("c_in", "c_out", "h", "w"), [(40, 40, 33, 48), (24, 40, 16, 32)])
 def test_unsupported_c_out_is_rejected_and_falls_back(c_in, c_out, h, w):
     assert select_conv3x3_config(c_out, w) is None
-    # bf16 has no MIOpen Winograd, so it reaches torch. fp16 is delegated while the input is small.
-    assert select_backend(torch.bfloat16, c_in, c_out, h, w) == "torch"
+    assert select_backend(torch.bfloat16, c_in, c_out, h, w) == "miopen"
     assert select_backend(torch.float16, c_in, c_out, h, w) == "miopen"
     for dtype in DTYPES:
         x = torch.randn((1, c_in, h, w), device="cuda", dtype=torch.float32).to(dtype)
@@ -226,9 +225,24 @@ def test_select_backend():
     assert select_backend(torch.bfloat16, 512, 512, 256, 256) == "kernel"
     # beyond the window MIOpen's Winograd loses, so fp16 goes back to the kernel
     assert select_backend(torch.float16, 128, 128, 2048, 2048) == "kernel"
-    # no tile and not delegated -> plain torch
-    assert select_backend(torch.bfloat16, 512, 512, 16, 16) == "torch"
+    # no tile at all (width below the smallest block): MIOpen against im2col, so delegated
+    assert select_backend(torch.bfloat16, 512, 512, 16, 16) == "miopen"
+    # float32 is not a kernel dtype and MIOpen gets nothing out of it either
     assert select_backend(torch.float32, 512, 512, 256, 256) == "torch"
+
+
+def test_no_tile_shapes_delegate_to_miopen_while_it_wins():
+    """A VAE's first conv (C_in=4) and last one (C_out=3) are exactly the no-tile delegation case."""
+    assert select_backend(torch.bfloat16, 4, 96, 1024, 1024) == "miopen"
+    assert select_backend(torch.float16, 4, 96, 1024, 1024) == "miopen"
+    assert select_backend(torch.bfloat16, 96, 3, 1024, 1024) == "miopen"
+    assert select_backend(torch.bfloat16, 96, 3, 2048, 2048) == "miopen"
+    # MIOpen's bf16 implicit-GEMM path collapses past about a billion input elements (96->3 at 3584^2
+    # measures 903 ms against im2col's 226), so bf16 keeps its cap there and fp16 does not.
+    assert select_backend(torch.bfloat16, 96, 3, 3584, 3584) == "torch"
+    assert select_backend(torch.float16, 96, 3, 3584, 3584) == "miopen"
+    # a tileable shape still goes to the kernel, whatever the fallback rule says
+    assert select_backend(torch.bfloat16, 96, 96, 1024, 1024) == "kernel"
 
 
 def test_fp16_conv2d_is_delegated_to_miopen():

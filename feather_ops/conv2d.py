@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch.library import custom_op
 
-from .tiles import CONV_PREFETCH_MIN_C_IN, CONV_TILES, MIOPEN_FP16_MAX_INPUT_ELEMS, conv_block_sizes
+from .tiles import CONV_PREFETCH_MIN_C_IN, CONV_TILES, MIOPEN_BF16_FALLBACK_MAX_INPUT_ELEMS, MIOPEN_FP16_MAX_INPUT_ELEMS, conv_block_sizes
 
 # `(block_m, block_n) -> tile` for the one-row instantiations, which is the vocabulary the selector below
 # reasons in. The two-row tiles are the same box with a different `rows`.
@@ -79,19 +79,28 @@ def conv3x3_prefetch(tile: tuple[int, int, int, int, int], c_in: int) -> bool:
 def select_backend(dtype: torch.dtype, c_in: int, c_out: int, height: int, width: int) -> str:
     """Which implementation should run this 3x3 stride-1 convolution.
 
-    `"kernel"` for `conv3x3_prepacked`, `"miopen"` for the delegated fp16 path (`F.conv2d` with
-    cuDNN/MIOpen forced on), `"torch"` when the kernel has no tile for this shape.
+    `"kernel"` for `conv3x3_prepacked`, `"miopen"` for the delegated path (`F.conv2d` with cuDNN/MIOpen
+    forced on), `"torch"` for plain `F.conv2d`, which ComfyUI runs as im2col + `addmm`.
 
     fp16 is delegated while the input is small enough to stay cache-resident, because MIOpen's fp16
     Winograd does 4/9 of the multiplies and gfx11 has the packed fp16 VALU instructions that make its
     transforms cheap, which a direct convolution cannot match. Past that footprint the activation
-    stream goes cache-cold and the kernel takes over. bf16 is never delegated: MIOpen has no bf16
-    Winograd, and its best bf16 path is slower than this kernel.
+    stream goes cache-cold and the kernel takes over. bf16 is never delegated for a shape the kernel
+    tiles: MIOpen has no bf16 Winograd, and its best bf16 path is slower than this kernel.
+
+    A shape the kernel cannot tile - `C_in % 8`, a `C_out` that no tile divides, a width below 32 - is
+    a different question: there the choice is MIOpen against im2col, and im2col is what torch does
+    today, 2-10x slower than MIOpen on the measured no-tile shapes (a VAE's first and last conv are
+    exactly these). Those are delegated while MIOpen holds that lead, which for bf16 stops at
+    `MIOPEN_BF16_FALLBACK_MAX_INPUT_ELEMS`.
     """
-    if dtype == torch.float16 and c_in * height * width <= MIOPEN_FP16_MAX_INPUT_ELEMS:
+    elements = c_in * height * width
+    if dtype == torch.float16 and elements <= MIOPEN_FP16_MAX_INPUT_ELEMS:
         return "miopen"
-    if dtype in (torch.bfloat16, torch.float16) and select_conv3x3_config(c_out, width) is not None:
+    if dtype in (torch.bfloat16, torch.float16) and c_in % 8 == 0 and select_conv3x3_config(c_out, width) is not None:
         return "kernel"
+    if dtype == torch.float16 or (dtype == torch.bfloat16 and elements <= MIOPEN_BF16_FALLBACK_MAX_INPUT_ELEMS):
+        return "miopen"
     return "torch"
 
 
@@ -218,7 +227,7 @@ def _can_use_kernel(
         return False
     if tuple(weight.shape[2:]) != (3, 3):
         return False
-    if weight.shape[1] != x.shape[1] or x.shape[1] % 8:
+    if weight.shape[1] != x.shape[1]:
         return False
     if not (x.is_contiguous() and weight.is_contiguous()):
         return False
@@ -287,8 +296,8 @@ def conv2d(
     """Drop-in replacement for `torch.nn.functional.conv2d`.
 
     Runs the HIP kernel for bf16 NCHW 3x3 stride-1 padding-1 convolutions, delegates fp16 to MIOpen's
-    Winograd (see `select_backend`), and falls back to `F.conv2d` for everything else, so callers
-    never need to check.
+    Winograd and the shapes the kernel cannot tile to MIOpen as well (see `select_backend`), and falls
+    back to `F.conv2d` for everything else, so callers never need to check.
     """
     stride_t, padding_t, dilation_t = _triple(stride), _triple(padding), _triple(dilation)
     if _can_use_kernel(input, weight, bias, stride_t, padding_t, dilation_t, groups):
