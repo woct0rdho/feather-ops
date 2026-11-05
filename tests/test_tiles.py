@@ -1,9 +1,3 @@
-"""The generated instantiation header, and the tiles the heuristics can return.
-
-The tables in `feather_ops/tiles.py` are the source the kernels are generated from, so these two checks
-are the only place the heuristics and the kernel can disagree.
-"""
-
 import pathlib
 import subprocess
 import sys

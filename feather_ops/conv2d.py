@@ -7,7 +7,8 @@ that order. Activations go in as they are (a halo tile per 16-channel group is s
 input element is read once per block rather than once per tap).
 
 `conv2d` mirrors `torch.nn.functional.conv2d` and silently falls back to it for anything the
-kernel does not cover, so it is safe to use as a drop-in.
+kernel does not cover, so it is safe to use as a drop-in. `conv3x3_eligibility` is the same decision
+as a reason code, for callers that want to log why a layer is not on the kernel.
 
 fp16 3x3 stride-1 is delegated to torch (MIOpen) on purpose: Winograd does 4/9 of the multiplies and
 gfx11 has the packed fp16 VALU instructions that make its transforms cheap, which a direct
@@ -105,7 +106,7 @@ def select_backend(dtype: torch.dtype, c_in: int, c_out: int, height: int, width
 
 
 @contextlib.contextmanager
-def _miopen_flags():
+def miopen_flags():
     """Force `cudnn.enabled = True` and `cudnn.benchmark = False` for one call, then restore.
 
     `torch.backends.cudnn.flags()` would do the same, but it also re-sets `benchmark_limit`,
@@ -122,7 +123,7 @@ def _miopen_flags():
         torch.backends.cudnn.benchmark = benchmark
 
 
-def _conv2d_miopen(
+def conv2d_miopen(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
@@ -139,7 +140,7 @@ def _conv2d_miopen(
     """
     # benchmark=False pins MIOpen to its heuristic find (no exhaustive search, no autotune), which
     # is the point of delegating: the solver is picked once by MIOpen's predictor, per shape.
-    with _miopen_flags():
+    with miopen_flags():
         return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
 
 
@@ -203,37 +204,42 @@ def conv3x3_prepacked(
     return out
 
 
-def weight_function_is_absent(module: torch.nn.Module) -> bool:
-    """ComfyUI compatibility: a patched weight (LoRA / low-VRAM) must not use the prepacked copy."""
-    return getattr(module, "weight_function", None) is None and getattr(module, "bias_function", None) is None
-
-
-def _can_use_kernel(
+def conv3x3_eligibility(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    stride,
-    padding,
-    dilation,
-    groups: int,
-) -> bool:
-    if groups != 1 or x.ndim != 4:
-        return False
+    bias: torch.Tensor | None = None,
+    stride=1,
+    padding=1,
+    dilation=1,
+    groups: int = 1,
+) -> str | None:
+    """None if `conv3x3_prepacked` can run this call, else a short reason code.
+
+    The reasons are stable strings meant for a log line (`"input is not a contiguous NCHW tensor"`,
+    `"autograd is enabled"`, ...). They say why the kernel cannot run. Whether the caller should fall
+    back to `F.conv2d` or to MIOpen is `select_backend`'s decision, which is a different question.
+    """
+    if groups != 1:
+        return f"{groups} groups"
+    if x.ndim != 4:
+        return f"input has {x.ndim} dimensions"
     if x.dtype not in (torch.bfloat16, torch.float16) or weight.dtype != x.dtype:
-        return False
+        return f"dtype {x.dtype} / weight {weight.dtype}"
     if not (x.is_cuda and weight.is_cuda and x.device == weight.device):
-        return False
-    if tuple(stride) != (1, 1) or tuple(padding) != (1, 1) or tuple(dilation) != (1, 1):
-        return False
-    if tuple(weight.shape[2:]) != (3, 3):
-        return False
-    if weight.shape[1] != x.shape[1]:
-        return False
+        return "input and weight are not on the same CUDA device"
+    if tuple(_triple(stride)) != (1, 1) or tuple(_triple(dilation)) != (1, 1):
+        return f"stride {_triple(stride)}, dilation {_triple(dilation)}"
+    if tuple(_triple(padding)) != (1, 1):
+        return f"padding {_triple(padding)}"
+    if tuple(weight.shape[2:]) != (3, 3) or weight.shape[1] != x.shape[1]:
+        return f"weight shape {tuple(weight.shape)}"
     if not (x.is_contiguous() and weight.is_contiguous()):
-        return False
+        return "input or weight is not contiguous"
     if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
-        return False
-    return not (bias is not None and (bias.dtype != x.dtype or bias.numel() != weight.shape[0]))
+        return "autograd is enabled"
+    if bias is not None and (bias.dtype != x.dtype or bias.numel() != weight.shape[0]):
+        return f"bias {bias.dtype} / {bias.numel()} elements"
+    return None
 
 
 def _triple(value) -> tuple[int, ...]:
@@ -299,77 +305,11 @@ def conv2d(
     Winograd and the shapes the kernel cannot tile to MIOpen as well (see `select_backend`), and falls
     back to `F.conv2d` for everything else, so callers never need to check.
     """
-    stride_t, padding_t, dilation_t = _triple(stride), _triple(padding), _triple(dilation)
-    if _can_use_kernel(input, weight, bias, stride_t, padding_t, dilation_t, groups):
-        backend = select_backend(input.dtype, input.shape[1], weight.shape[0], input.shape[2], input.shape[3])
-        if backend == "kernel":
-            return conv3x3_prepacked(input, _PACKED_CACHE.get(weight), bias)
-        if backend == "miopen":
-            return _conv2d_miopen(input, weight, bias, stride, padding, dilation, groups)
+    if conv3x3_eligibility(input, weight, bias, stride, padding, dilation, groups) is not None:
+        return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
+    backend = select_backend(input.dtype, input.shape[1], weight.shape[0], input.shape[2], input.shape[3])
+    if backend == "kernel":
+        return conv3x3_prepacked(input, _PACKED_CACHE.get(weight), bias)
+    if backend == "miopen":
+        return conv2d_miopen(input, weight, bias, stride, padding, dilation, groups)
     return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
-
-
-class Conv2d(torch.nn.Conv2d):
-    """`nn.Conv2d` that keeps a prepacked copy of its weight for the HIP 3x3 kernel (bf16 only).
-
-    `state_dict` is unchanged: the prepack lives in a non-persistent buffer and is rebuilt lazily
-    after a weight update, a dtype/device move, or a `load_state_dict`.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.register_buffer("_packed_weight", torch.empty(0), persistent=False)
-        self.register_buffer("_packed_bias", None, persistent=False)
-        self._packed_key = None
-        self._packed_enabled = self._kernel_applies()
-
-    def _kernel_applies(self) -> bool:
-        return (
-            self.groups == 1
-            and tuple(self.kernel_size) == (3, 3)
-            and tuple(self.stride) == (1, 1)
-            and tuple(self.padding) == (1, 1)
-            and tuple(self.dilation) == (1, 1)
-            and self.padding_mode == "zeros"
-        )
-
-    def invalidate_packed_weight(self) -> None:
-        self._packed_key = None
-        self._packed_weight = torch.empty(0, device=self.weight.device, dtype=self.weight.dtype)
-        self._packed_bias = None
-
-    def _load_from_state_dict(self, *args, **kwargs) -> None:
-        super()._load_from_state_dict(*args, **kwargs)
-        self.invalidate_packed_weight()
-
-    def _apply(self, fn, recurse: bool = True):
-        result = super()._apply(fn, recurse)
-        self.invalidate_packed_weight()
-        return result
-
-    def pack_weight(self) -> None:
-        if not self._packed_enabled or self.weight.dtype not in (torch.bfloat16, torch.float16):
-            return
-        self._packed_weight = prepack_conv2d_weight_3x3(self.weight)
-        if self.bias is None:
-            self._packed_bias = None
-        elif self.bias.dtype == self.weight.dtype and self.bias.is_contiguous():
-            self._packed_bias = self.bias
-        else:
-            self._packed_bias = self.bias.detach().to(self.weight.dtype).contiguous()
-        self._packed_key = weight_cache_key(self.weight)
-
-    def _in_scope(self, input: torch.Tensor) -> bool:
-        """Whether this call is a 3x3 stride-1 NCHW conv the fast paths can take at all."""
-        return self._packed_enabled and weight_function_is_absent(self) and _can_use_kernel(input, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self._in_scope(input):
-            backend = select_backend(input.dtype, input.shape[1], self.weight.shape[0], input.shape[2], input.shape[3])
-            if backend == "kernel":
-                if self._packed_key != weight_cache_key(self.weight) or self._packed_weight.numel() == 0:
-                    self.pack_weight()
-                return conv3x3_prepacked(input, self._packed_weight, self._packed_bias)
-            if backend == "miopen":
-                return _conv2d_miopen(input, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
-        return F.conv2d(input, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)

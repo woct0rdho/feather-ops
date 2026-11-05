@@ -1,6 +1,6 @@
 """The instantiations of the three kernels, and the tile vocabulary the heuristics choose from.
 
-This module is the single source of truth: `tools/gen_tiles.py` compiles these lists into
+This file is the single source of truth: `tools/gen_tiles.py` compiles these lists into
 `csrc/feather_tiles.h`, which is what the `.cu` files use to instantiate and dispatch, so a tile that the
 heuristics can return is always an instantiated kernel. Adding a tile is one line here plus a rebuild.
 It must not import torch, because `setup.py` reads it before the extension exists.

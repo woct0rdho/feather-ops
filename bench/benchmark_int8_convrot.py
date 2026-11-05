@@ -20,7 +20,7 @@ import torch
 
 from bench.cells import cells
 from bench.protocol import Case, add_protocol_args, run_cases
-from feather_ops.int8_convrot import int8_scaled_mm, prepack_int8_convrot_weight, select_int8_config
+from feather_ops.int8_convrot import int8_scaled_mm, prepack_int8_weight, select_int8_config
 from feather_ops.tiles import INT8_TILES
 
 DEV = "cuda"
@@ -31,7 +31,7 @@ def build_case(M: int, N_w: int, K_w: int, transposed_b: bool, configs, bf16: bo
     contraction, n_out = (N_w, K_w) if transposed_b else (K_w, N_w)
     gen = torch.Generator(device=DEV).manual_seed(0)
     wq = torch.randint(-127, 128, (N_w, K_w), device=DEV, dtype=torch.int8, generator=gen)
-    packed = prepack_int8_convrot_weight(wq)
+    packed = prepack_int8_weight(wq)
     a = torch.randint(-127, 128, (M, contraction), device=DEV, dtype=torch.int8).contiguous()
     a_scale = torch.rand(M, device=DEV, dtype=torch.float32, generator=gen) * 0.02 + 1e-4
     b_scale = None if transposed_b else (torch.rand(n_out, device=DEV, dtype=torch.float32) * 0.02 + 1e-4)

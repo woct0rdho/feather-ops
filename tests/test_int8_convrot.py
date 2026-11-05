@@ -2,11 +2,19 @@ import pytest
 import torch
 
 from feather_ops.int8_convrot import (
-    convrot_quantize_activation,
+    build_hadamard,
+    convrot_int8_dgrad,
+    convrot_int8_linear,
+    convrot_int8_supported,
+    dequantize_convrot_weight,
     int8_scaled_mm,
-    prepack_int8_convrot_weight,
+    prepack_int8_weight,
+    quantize_convrot_activation,
+    quantize_convrot_weight,
+    quantize_rowwise_int8,
+    rotate,
     select_int8_config,
-    unpack_int8_convrot_weight,
+    unpack_int8_weight,
 )
 from feather_ops.tiles import INT8_TILES
 
@@ -61,17 +69,18 @@ def _max_rel(got, ref):
 def test_prepack_round_trip_is_lossless():
     for n, k in [(4, 4), (96, 512), (2048, 8192), (4304, 1152)]:
         wq = _quantized(-127, 128, (n, k), seed=n + k)
-        packed = prepack_int8_convrot_weight(wq)
+        packed = prepack_int8_weight(wq)
         assert packed.shape == (k // 4, n // 4, 4, 4)
         assert packed.dtype == torch.int8
         # a single copy: the permutation does not change the number of bytes
         assert packed.numel() == wq.numel()
-        assert torch.equal(unpack_int8_convrot_weight(packed), wq)
+        assert torch.equal(unpack_int8_weight(packed), wq)
 
 
-def test_prepack_requires_multiple_of_four():
-    with pytest.raises(ValueError, match="multiples of 4"):
-        prepack_int8_convrot_weight(torch.zeros(6, 8, dtype=torch.int8, device=DEV))
+def test_prepack_requires_a_4x4_tile():
+    # the layout is checked by the view (and the extent by the op), so this is a runtime layout error
+    with pytest.raises(RuntimeError):
+        prepack_int8_weight(torch.zeros(6, 8, dtype=torch.int8, device=DEV))
 
 
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
@@ -79,7 +88,7 @@ def test_prepack_requires_multiple_of_four():
 def test_forward_matches_dequantized_reference(out_dtype, has_bias):
     M, N, K = 512, 5888, 4096
     wq = _quantized(-127, 128, (N, K), seed=1)
-    packed = prepack_int8_convrot_weight(wq)
+    packed = prepack_int8_weight(wq)
     a = _quantized(-127, 128, (M, K), seed=2)
     a_scale = _scales(M, seed=3)
     w_scale = _scales(N, seed=4)
@@ -93,7 +102,7 @@ def test_forward_matches_dequantized_reference(out_dtype, has_bias):
 def test_backward_matches_dequantized_reference():
     M, N, K = 512, 5888, 4096
     wq = _quantized(-127, 128, (N, K), seed=5)
-    packed = prepack_int8_convrot_weight(wq)
+    packed = prepack_int8_weight(wq)
     dy = _quantized(-127, 128, (M, N), seed=6)
     dy_scale = _scales(M, seed=7)
     got = int8_scaled_mm(dy, packed, dy_scale, None, None, torch.bfloat16, True)
@@ -103,7 +112,7 @@ def test_backward_matches_dequantized_reference():
 
 
 def test_backward_rejects_a_weight_scale():
-    packed = prepack_int8_convrot_weight(_quantized(-127, 128, (64, 64), seed=8))
+    packed = prepack_int8_weight(_quantized(-127, 128, (64, 64), seed=8))
     a = _quantized(-127, 128, (8, 64), seed=9)
     with pytest.raises(ValueError, match="fold"):
         int8_scaled_mm(a, packed, _scales(8, 10), _scales(64, 11), None, torch.bfloat16, True)
@@ -114,7 +123,7 @@ def test_backward_rejects_a_weight_scale():
 def test_model_cells_against_reference(M, N_w, K_w, transposed_b):
     contraction, out = (N_w, K_w) if transposed_b else (K_w, N_w)
     wq = _quantized(-127, 128, (N_w, K_w), seed=0)
-    packed = prepack_int8_convrot_weight(wq)
+    packed = prepack_int8_weight(wq)
     a = _quantized(-127, 128, (M, contraction), seed=1)
     a_scale = _scales(M, seed=2)
     if transposed_b:
@@ -137,7 +146,7 @@ def test_every_table_config(cfg, transposed_b):
     K_w = 16 * unroll_k * 3
     contraction, out = (N_w, K_w) if transposed_b else (K_w, N_w)
     wq = _quantized(-127, 128, (N_w, K_w), seed=12)
-    packed = prepack_int8_convrot_weight(wq)
+    packed = prepack_int8_weight(wq)
     a = _quantized(-127, 128, (M, contraction), seed=13)
     a_scale = _scales(M, seed=14)
     if transposed_b:
@@ -264,7 +273,7 @@ def test_quantize_matches_the_reference_recipe(dtype, rotate, shape):
     M, K = shape
     torch.manual_seed(0)
     x = (torch.randn(M, K, device=DEV, dtype=torch.float32) * 2.0).to(dtype)
-    q, scale = convrot_quantize_activation(x, rotate=rotate)
+    q, scale = quantize_convrot_activation(x, rotate=rotate)
     ref_q, ref_scale = _reference_quantize(x, rotate)
     assert q.shape == (M, K) and q.dtype == torch.int8
     assert scale.shape == (M,) and scale.dtype == torch.float32
@@ -313,7 +322,7 @@ def test_quantize_every_plan_width(K, rotate):
     M = 3
     torch.manual_seed(K)
     x = (torch.randn(M, K, device=DEV, dtype=torch.float32) * 2.0).to(torch.bfloat16)
-    q, scale = convrot_quantize_activation(x, rotate=rotate)
+    q, scale = quantize_convrot_activation(x, rotate=rotate)
     ref_q, ref_scale = _reference_quantize(x, rotate)
     dq = q.float() * scale[:, None]
     ref_dq = ref_q.float() * ref_scale[:, None]
@@ -330,7 +339,7 @@ def test_quantize_wide_rows_fold_the_column_scale(K, dtype):
     torch.manual_seed(K)
     x = (torch.randn(M, K, device=DEV, dtype=torch.float32) * 2.0).to(dtype)
     col_scale = (torch.rand(K, device=DEV, dtype=torch.float32) * 0.5 + 0.5).to(torch.float32)
-    q, scale = convrot_quantize_activation(x, rotate=False, col_scale=col_scale)
+    q, scale = quantize_convrot_activation(x, rotate=False, col_scale=col_scale)
     ref_q, ref_scale = _reference_quantize(x, False, col_scale)
     dq = q.float() * scale[:, None]
     ref_dq = ref_q.float() * ref_scale[:, None]
@@ -344,7 +353,7 @@ def test_quantize_folds_the_column_scale():
     torch.manual_seed(1)
     x = torch.randn(M, K, device=DEV, dtype=torch.bfloat16)
     col_scale = torch.rand(K, device=DEV, dtype=torch.float32) * 0.5 + 0.5
-    q, scale = convrot_quantize_activation(x, rotate=False, col_scale=col_scale)
+    q, scale = quantize_convrot_activation(x, rotate=False, col_scale=col_scale)
     ref_q, ref_scale = _reference_quantize(x, False, col_scale)
     dq = q.float() * scale[:, None]
     ref_dq = ref_q.float() * ref_scale[:, None]
@@ -355,7 +364,7 @@ def test_quantize_folds_the_column_scale():
 def test_quantize_rejects_a_non_multiple_of_the_group_size():
     x = torch.zeros(4, 384, device=DEV, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="multiple of the ConvRot group size"):
-        convrot_quantize_activation(x)
+        quantize_convrot_activation(x)
 
 
 def test_quantize_output_feeds_the_gemm():
@@ -364,9 +373,9 @@ def test_quantize_output_feeds_the_gemm():
     torch.manual_seed(2)
     wq = _quantized(-127, 128, (N, K), seed=3)
     w_scale = _scales(N, seed=4)
-    packed = prepack_int8_convrot_weight(wq)
+    packed = prepack_int8_weight(wq)
     x = torch.randn(M, K, device=DEV, dtype=torch.bfloat16) * 0.1
-    q, scale = convrot_quantize_activation(x, rotate=True)
+    q, scale = quantize_convrot_activation(x, rotate=True)
     got = int8_scaled_mm(q, packed, scale, w_scale, None, torch.bfloat16, False)
     # W = W_rot @ R^T, i.e. the stored weight rotated back per group
     h = _hadamard(256, torch.float32)
@@ -379,7 +388,7 @@ def test_compile_is_supported():
     """The schedule heuristic lives behind an opaque op, so a dynamic graph is one node and matches eager."""
     torch.manual_seed(0)
     m, n_w, k_w = 4112, 1152, 1152
-    packed = prepack_int8_convrot_weight(torch.randint(-127, 128, (n_w, k_w), device=DEV, dtype=torch.int8))
+    packed = prepack_int8_weight(torch.randint(-127, 128, (n_w, k_w), device=DEV, dtype=torch.int8))
     a = torch.randint(-127, 128, (m, k_w), device=DEV, dtype=torch.int8)
     a_scale = torch.rand(m, device=DEV, dtype=torch.float32) * 0.02
     w_scale = torch.rand(n_w, device=DEV, dtype=torch.float32) * 0.02
@@ -390,3 +399,157 @@ def test_compile_is_supported():
     eager = run(a, a_scale)
     compiled = torch.compile(run, fullgraph=True, dynamic=True)(a, a_scale)
     assert torch.equal(compiled, eager)
+
+
+def _reference_hadamard(size: int) -> torch.Tensor:
+    h4 = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=torch.float32)
+    h, n = h4, 4
+    while n < size:
+        h = torch.kron(h, h4)
+        n *= 4
+    return h / (size**0.5)
+
+
+def _reference_quantize_weight(weight, rotate_dtype, clamp_min):
+    """The two conventions that exist in the wild, written out: rotate in `rotate_dtype`, clamp at `clamp_min`."""
+    hadamard = _reference_hadamard(256).to(weight.device)
+    out_f, in_f = weight.shape
+    grouped = weight.to(rotate_dtype).reshape(out_f, in_f // 256, 256)
+    rotated = torch.matmul(grouped, hadamard.T.to(dtype=rotate_dtype)).reshape(out_f, in_f)
+    scale = (rotated.abs().amax(dim=1).float() / 127.0).clamp(min=1e-30)
+    q = torch.clamp(torch.round(rotated.float() / scale[:, None]), clamp_min, 127.0).to(torch.int8)
+    return q, scale
+
+
+def test_hadamard_matches_the_reference_construction():
+    for size in (4, 16, 64, 256):
+        got = build_hadamard(size)
+        assert torch.equal(got, _reference_hadamard(size))
+        assert torch.equal(got, got.T)  # symmetric, so it is its own inverse
+        assert torch.equal(got @ got, torch.eye(size))  # orthogonal
+    # cached, and a different dtype/device is a different matrix
+    assert build_hadamard(256) is build_hadamard(256)
+    assert build_hadamard(256, dtype=torch.float64).dtype == torch.float64
+    with pytest.raises(ValueError, match="power of four"):
+        build_hadamard(12)
+
+
+@pytest.mark.parametrize("shape", [(4, 512), (64, 1024), (3, 256)])
+def test_rotate_is_its_own_inverse(shape):
+    x = torch.randn(shape, device=DEV, dtype=torch.float32)
+    hadamard = build_hadamard(256, device=DEV)
+    back = rotate(rotate(x, hadamard), hadamard)
+    assert torch.allclose(back, x, atol=1e-5)
+    with pytest.raises(ValueError, match="group size"):
+        rotate(torch.randn(3, 300, device=DEV), hadamard)
+
+
+def test_quantize_rowwise_int8_codes_and_clamp():
+    x = torch.randn(8, 256, device=DEV, dtype=torch.float32)
+    q, scale = quantize_rowwise_int8(x)
+    ref_scale = (x.abs().amax(dim=1) / 127.0).clamp(min=1e-30)
+    ref_q = torch.clamp(torch.round(x / ref_scale[:, None]), -127.0, 127.0).to(torch.int8)
+    assert torch.equal(q, ref_q)
+    assert torch.equal(scale, ref_scale)
+
+    # A scale derived from the row's absmax already stays inside [-127, 127], so the clamp is only a guard:
+    # no value, dtype or rounding can reach -128, which is why the -128 floor some weight recipes use is
+    # unobservable (and why the clamp is not an argument).
+    torch.manual_seed(0)
+    adversarial = [
+        -torch.ones(4, 256, device=DEV),  # the absmax is the most negative value
+        torch.randn(64, 512, device=DEV) * 1e-30,
+        torch.randn(64, 512, device=DEV) * 1e30,
+        torch.randn(64, 512, device=DEV).clamp(-1e-4, 1.0),
+    ]
+    for dtype in (torch.bfloat16, torch.float16):
+        adversarial += [t.to(dtype) for t in adversarial[:2]]
+    for tensor in adversarial:
+        codes = quantize_rowwise_int8(tensor)[0]
+        assert codes.min() >= -127 and codes.max() <= 127
+
+    # a stored scale can be out of range, and there the bound is the absmax's code, not -128
+    x = torch.tensor([[-1.0, 0.5]], device=DEV)
+    stored_scale = torch.tensor([1.0 / 130.0], device=DEV)  # -1 / scale = -130
+    assert quantize_rowwise_int8(x, stored_scale)[0].min() == -127
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(64, 256), (64, 512), (128, 1024), (36, 2048), (1152, 1024)])
+@pytest.mark.parametrize("rotate_dtype", [torch.float32, None])
+def test_quantize_convrot_weight_matches_the_reference(dtype, shape, rotate_dtype):
+    """The rotation dtype is the degree of freedom: fp32 (sd-scripts) or the weight's own dtype (comfy-quants)."""
+    torch.manual_seed(0)
+    weight = torch.randn(shape, device=DEV, dtype=torch.float32).to(dtype)
+    q, scale = quantize_convrot_weight(weight, rotate_dtype=rotate_dtype)
+    ref_q, ref_scale = _reference_quantize_weight(weight, rotate_dtype or dtype, clamp_min=-127.0)
+    assert q.dtype == torch.int8 and q.shape == weight.shape
+    assert torch.equal(q, ref_q)
+    assert torch.equal(scale, ref_scale)
+    # the -128 floor one reference implementation uses cannot change a single code on a derived scale
+    assert torch.equal(q, _reference_quantize_weight(weight, rotate_dtype or dtype, clamp_min=-128.0)[0])
+
+
+def test_dequantize_convrot_weight_round_trips_the_rotation():
+    torch.manual_seed(1)
+    weight = (torch.randn(64, 512, device=DEV, dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    q, scale = quantize_convrot_weight(weight, rotate_dtype=torch.float32)
+    back = dequantize_convrot_weight(q, scale)
+    relative = (back - weight.float()).norm() / weight.float().norm()
+    # one int8 rounding per row: worst case 1/(2*127) of the row's absmax, scaled by absmax/rms
+    assert relative < 1e-2
+    assert back.dtype == torch.float32
+
+
+def test_convrot_int8_supported():
+    assert convrot_int8_supported((256, 1024)) == (True, "")
+    assert convrot_int8_supported((256, 1024), backward=False) == (True, "")
+    ok, reason = convrot_int8_supported((4, 1024))
+    assert not ok and "16" in reason  # the input gradient contracts this axis
+    assert convrot_int8_supported((4, 1024), backward=False)[0]
+    ok, reason = convrot_int8_supported((256, 1024), groupsize=64)
+    assert not ok and "group size" in reason
+    assert not convrot_int8_supported((256, 1000))[0]  # K must be a multiple of 256
+    assert not convrot_int8_supported((254, 1024))[0]  # N must be a multiple of 4
+
+
+@pytest.mark.parametrize("shape", [(4, 256, 512), (32, 256, 1024)])
+@pytest.mark.parametrize("weight_packed", [True, False])
+def test_convrot_int8_linear_matches_the_composition(shape, weight_packed):
+    M, n_out, k_in = shape
+    w = _quantized(-127, 128, (n_out, k_in), seed=2)
+    w_scale = _scales(n_out, seed=4)
+    bias = torch.randn(n_out, device=DEV, dtype=torch.bfloat16) * 0.1
+
+    x = torch.randn(M, k_in, device=DEV, dtype=torch.bfloat16)
+    packed = prepack_int8_weight(w) if weight_packed else w
+    got = convrot_int8_linear(x, packed, w_scale, bias, torch.bfloat16, weight_packed=weight_packed)
+    q, s = quantize_convrot_activation(x, rotate=True)
+    ref = int8_scaled_mm(q, prepack_int8_weight(w), s, w_scale, bias, torch.bfloat16, False)
+    assert torch.equal(got, ref)
+
+
+@pytest.mark.parametrize("weight_packed", [True, False])
+def test_convrot_int8_dgrad_matches_the_composition(weight_packed):
+    M, n_out, k_in = 32, 512, 1024
+    w = _quantized(-127, 128, (n_out, k_in), seed=5)
+    w_scale = _scales(n_out, seed=6)
+    g = torch.randn(M, n_out, device=DEV, dtype=torch.bfloat16)
+
+    packed = prepack_int8_weight(w) if weight_packed else w
+    got = convrot_int8_dgrad(g, packed, w_scale, torch.bfloat16, weight_packed=weight_packed)
+    q, s = quantize_convrot_activation(g, rotate=False, col_scale=w_scale)
+    ref = int8_scaled_mm(q, prepack_int8_weight(w), s, None, None, torch.bfloat16, True)
+    ref = rotate(ref, build_hadamard(256, device=DEV, dtype=torch.bfloat16))
+    assert got.shape == (M, k_in)
+    assert torch.equal(got, ref)
+
+
+def test_convrot_int8_linear_leaves_the_shape_checks_to_the_op():
+    x = torch.randn(4, 1000, device=DEV, dtype=torch.bfloat16)
+    w = torch.zeros(256, 1000, device=DEV, dtype=torch.int8)
+    with pytest.raises(RuntimeError, match="group size"):
+        convrot_int8_linear(x, w, torch.ones(256, device=DEV))
+    # a mismatched activation is caught here, because `n_out` comes from the weight's extent
+    with pytest.raises(ValueError, match="features"):
+        convrot_int8_linear(x, torch.zeros(256, 512, device=DEV, dtype=torch.int8), torch.ones(256, device=DEV))

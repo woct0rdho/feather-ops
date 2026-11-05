@@ -21,7 +21,7 @@ import torch
 
 from bench.cells import cells
 from bench.protocol import Case, add_protocol_args, run_cases
-from feather_ops.int8_convrot import int8_scaled_mm, prepack_int8_convrot_weight, select_int8_config
+from feather_ops.int8_convrot import int8_scaled_mm, prepack_int8_weight, select_int8_config
 from feather_ops.scaled_mm import prepack_b_for_scaled_mm, scaled_mm_hip
 
 DEV = "cuda"
@@ -51,7 +51,7 @@ def build_case(group: str, M: int, N_w: int, K_w: int, backends: set[str]) -> Ca
             providers["bf16"] = lambda: torch.mm(a16, weight.t())
 
     if "int8_fwd" in backends or "int8_bwd" in backends:
-        packed = prepack_int8_convrot_weight(torch.randint(-127, 128, (N_w, K_w), device=DEV, dtype=torch.int8, generator=gen))
+        packed = prepack_int8_weight(torch.randint(-127, 128, (N_w, K_w), device=DEV, dtype=torch.int8, generator=gen))
         for name, transposed_b in (("int8_fwd", False), ("int8_bwd", True)):
             if name not in backends:
                 continue

@@ -2,7 +2,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from feather_ops.conv2d import Conv2d, conv2d, conv3x3_prepacked, prepack_conv2d_weight_3x3, select_backend, select_conv3x3_config
+from feather_ops.conv2d import (
+    conv2d,
+    conv2d_miopen,
+    conv3x3_eligibility,
+    conv3x3_prepacked,
+    prepack_conv2d_weight_3x3,
+    select_backend,
+    select_conv3x3_config,
+)
 from feather_ops.tiles import CONV_TILES, conv_block_sizes
 
 DTYPES = [torch.bfloat16, torch.float16]
@@ -86,6 +94,28 @@ def test_unsupported_c_out_is_rejected_and_falls_back(c_in, c_out, h, w):
         assert float((got.double() - ref).norm() / ref.norm()) < 4e-3
 
 
+def test_conv3x3_eligibility_reasons():
+    weight = torch.randn((16, 8, 3, 3), device="cuda", dtype=torch.bfloat16)
+    x = torch.randn((1, 8, 16, 16), device="cuda", dtype=torch.bfloat16)
+    assert conv3x3_eligibility(x, weight) is None
+    assert conv3x3_eligibility(x, weight, groups=2) == "2 groups"
+    reason = conv3x3_eligibility(x[:, 0], weight)
+    assert reason is not None and reason.startswith("input has 3 dimensions")
+    assert conv3x3_eligibility(x.float(), weight) == "dtype torch.float32 / weight torch.bfloat16"
+    assert conv3x3_eligibility(x.cpu(), weight.cpu()) == "input and weight are not on the same CUDA device"
+    assert conv3x3_eligibility(x, weight, stride=2) == "stride (2, 2), dilation (1, 1)"
+    assert conv3x3_eligibility(x, weight, padding=0) == "padding (0, 0)"
+    assert conv3x3_eligibility(x, weight, dilation=2) == "stride (1, 1), dilation (2, 2)"
+    assert conv3x3_eligibility(x, torch.randn(16, 16, 3, 3, device="cuda", dtype=torch.bfloat16)) == ("weight shape (16, 16, 3, 3)")
+    assert conv3x3_eligibility(x.transpose(2, 3), weight) == "input or weight is not contiguous"
+    assert conv3x3_eligibility(x, weight, bias=torch.zeros(8, device="cuda")) == "bias torch.float32 / 8 elements"
+    torch.set_grad_enabled(True)
+    try:
+        assert conv3x3_eligibility(x.requires_grad_(), weight) == "autograd is enabled"
+    finally:
+        torch.set_grad_enabled(False)
+
+
 def test_prepack_roundtrip_is_a_permutation():
     for c_in, c_out in [(16, 8), (32, 33), (144, 96), (24, 5), (21, 5)]:
         weight = torch.randn((c_out, c_in, 3, 3))
@@ -112,44 +142,6 @@ def test_functional_api_matches_torch_and_falls_back():
     x = torch.randn((1, 96, 33, 33), device="cuda", dtype=torch.bfloat16)
     weight = torch.randn((96, 96, 3, 3), device="cuda", dtype=torch.bfloat16)
     assert torch.equal(conv2d(x, weight, None, 2, 0), F.conv2d(x, weight, None, 2, 0))
-
-
-def test_module_is_a_drop_in():
-    torch.manual_seed(1)
-    ref_mod = torch.nn.Conv2d(96, 96, 3, padding=1, bias=True).cuda().to(torch.bfloat16)
-    mod = Conv2d(96, 96, 3, padding=1, bias=True).cuda().to(torch.bfloat16)
-    mod.load_state_dict(ref_mod.state_dict())
-    assert set(mod.state_dict()) == set(ref_mod.state_dict())
-    x = torch.randn((1, 96, 96, 96), device="cuda", dtype=torch.bfloat16)
-    ref = ref_mod(x).detach()
-    out = mod(x)
-    assert float((out.double() - ref.double()).norm() / ref.double().norm()) < 4e-3
-    assert mod._packed_weight.numel() > 0
-    # a weight update invalidates the prepack
-    with torch.no_grad():
-        mod.weight.mul_(0.5)
-        ref_mod.weight.mul_(0.5)
-    out = mod(x)
-    ref = ref_mod(x).detach()
-    assert float((out.double() - ref.double()).norm() / ref.double().norm()) < 4e-3
-    # a dtype move invalidates it too
-    mod.half()
-    x = x.half()
-    ref_mod.half()
-    out = mod(x)
-    ref = ref_mod(x).detach()
-    assert float((out.double() - ref.double()).norm() / ref.double().norm()) < 4e-3
-
-
-def test_module_falls_back_when_autograd_is_active():
-    module = Conv2d(96, 96, 3, padding=1, bias=True).cuda().to(torch.bfloat16)
-    x = torch.randn((1, 96, 32, 32), device="cuda", dtype=torch.bfloat16)
-    torch.set_grad_enabled(True)
-    out = module(x)
-    torch.set_grad_enabled(False)
-    assert module._packed_weight.numel() == 0
-    ref = F.conv2d(x, module.weight, module.bias, 1, 1)
-    assert torch.equal(out, ref)
 
 
 def test_odd_shapes_and_batch():
@@ -204,16 +196,6 @@ def test_two_rows_matches_one_row_exactly():
         assert torch.equal(one, two), (c_out, h, w)
 
 
-def _miopen_conv2d(x, weight, bias):
-    """`F.conv2d` with MIOpen forced on, which is what the delegated path must produce."""
-    enabled = torch.backends.cudnn.enabled
-    torch.backends.cudnn.enabled = True
-    try:
-        return F.conv2d(x, weight, bias, 1, 1)
-    finally:
-        torch.backends.cudnn.enabled = enabled
-
-
 def test_select_backend():
     """fp16 3x3 s1 is delegated to MIOpen, bf16 is not, and the tile table decides the rest."""
     # fp16 inside the delegation footprint window
@@ -251,29 +233,10 @@ def test_fp16_conv2d_is_delegated_to_miopen():
     weight = (torch.randn((96, 96, 3, 3), device="cuda", dtype=torch.float32) * 0.05).to(torch.float16)
     bias = (torch.randn((96,), device="cuda", dtype=torch.float32) * 0.1).to(torch.float16)
     out = conv2d(x, weight, bias, 1, 1)
-    assert torch.equal(out, _miopen_conv2d(x, weight, bias)), "the delegated path is F.conv2d + MIOpen"
+    assert torch.equal(out, conv2d_miopen(x, weight, bias, 1, 1)), "the delegated path is F.conv2d + MIOpen"
     # and it really is not this kernel: fp16 Winograd vs direct differ at the bf16-arithmetic level
     kernel = conv3x3_prepacked(x, prepack_conv2d_weight_3x3(weight), bias)
     assert not torch.equal(out, kernel)
-
-
-def test_module_does_not_prepack_a_delegated_weight():
-    torch.manual_seed(12)
-    module = Conv2d(96, 96, 3, padding=1, bias=True).cuda().to(torch.float16)
-    with torch.no_grad():
-        module.weight.normal_(0, 0.05)
-        assert module.bias is not None
-        module.bias.normal_(0, 0.1)
-    x = torch.randn((1, 96, 128, 128), device="cuda", dtype=torch.float16)
-    assert torch.equal(module(x), _miopen_conv2d(x, module.weight, module.bias))
-    assert module._packed_weight.numel() == 0, "a delegated weight must not be prepacked"
-
-    # the same module in bf16 keeps the kernel path and does prepack
-    module = module.to(torch.bfloat16)
-    x = x.to(torch.bfloat16)
-    packed = prepack_conv2d_weight_3x3(module.weight)
-    assert torch.equal(module(x), conv3x3_prepacked(x, packed, module.bias))
-    assert module._packed_weight.numel() > 0
 
 
 def test_dispatch_matrix_matches_torch():
