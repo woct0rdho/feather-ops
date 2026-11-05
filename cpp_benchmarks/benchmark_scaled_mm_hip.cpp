@@ -41,7 +41,9 @@ extern "C" bool launch_scaled_mm(
     const int repeat_m,
     const int repeat_n,
     const bool use_fp8_e5m2,
-    const int output_dtype,
+    const bool a_bf16,
+    const bool a_cast_to_fp16,
+    const bool output_bf16,
     hipStream_t stream);
 
 struct Options
@@ -206,7 +208,8 @@ int main(int argc, char** argv)
             1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             true, // use_fp8_e5m2
-            0, // output_dtype=0 (fp16)
+            false, false, // a_bf16, a_cast_to_fp16
+            false, // output_bf16
             stream
         );
         if (!launched) {
@@ -231,7 +234,8 @@ int main(int argc, char** argv)
             1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             true, // use_fp8_e5m2
-            0, // output_dtype=0 (fp16)
+            false, false, // a_bf16, a_cast_to_fp16
+            false, // output_bf16
             stream
         );
         CHECK_HIP(hipEventRecord(stop, stream));

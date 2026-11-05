@@ -31,7 +31,6 @@ SHAPES = [
     (8, 16, 48, 64),
     (56, 512, 32, 64),
     (24, 96, 32, 96),
-    (40, 40, 33, 48),
     (1152, 1152, 16, 32),
     (64, 48, 9, 32),
     # two output rows per block: 128-wide images, and C_out that needs the 64-wide M tile
@@ -57,15 +56,30 @@ def test_conv3x3_matches_reference(dtype, c_in, c_out, h, w, with_bias):
     bias = (torch.randn((c_out,), device="cuda", dtype=torch.float32) * 0.1).to(dtype) if with_bias else None
 
     config = _select_config(c_out, w)
+    assert config is not None, f"the shape matrix is supported, but C_out={c_out} W={w} has no tile"
     packed = prepack_conv2d_weight_3x3(weight)
-    out = feather_ops.conv3x3_prepacked(x, packed, bias, *config) if config else None
-    if out is None:
-        pytest.skip(f"no tile for C_out={c_out} W={w}")
+    out = feather_ops.conv3x3_prepacked(x, packed, bias, *config)
     ref = _reference(x, weight, bias)
     assert torch.isfinite(out).all()
     rel = float((out.double() - ref).norm() / ref.norm())
     tol = 4e-3 if dtype == torch.bfloat16 else 6e-4
     assert rel < tol, f"rel={rel} for {dtype} {c_in}->{c_out} {h}x{w}"
+
+
+# C_out that no tile divides (40 = 8 * 5) is outside the kernel's contract: the dispatch must say so and
+# `conv2d` must still be a drop-in for `F.conv2d` through the documented fallback.
+@pytest.mark.parametrize(("c_in", "c_out", "h", "w"), [(40, 40, 33, 48), (24, 40, 16, 32)])
+def test_unsupported_c_out_is_rejected_and_falls_back(c_in, c_out, h, w):
+    assert _select_config(c_out, w) is None
+    # bf16 has no MIOpen Winograd, so it reaches torch. fp16 is delegated while the input is small.
+    assert select_backend(torch.bfloat16, c_in, c_out, h, w) == "torch"
+    assert select_backend(torch.float16, c_in, c_out, h, w) == "miopen"
+    for dtype in DTYPES:
+        x = torch.randn((1, c_in, h, w), device="cuda", dtype=torch.float32).to(dtype)
+        weight = (torch.randn((c_out, c_in, 3, 3), device="cuda", dtype=torch.float32) * 0.05).to(dtype)
+        got = feather_ops.conv2d(x, weight, None, 1, 1)
+        ref = _reference(x, weight, None)
+        assert float((got.double() - ref).norm() / ref.norm()) < 4e-3
 
 
 def test_prepack_roundtrip_is_a_permutation():

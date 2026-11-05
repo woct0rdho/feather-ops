@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""Kernel-only sweep of feather_ops.int8_scaled_mm over the model cells of the int8 ConvRot plan.
+"""Kernel-only sweep of `feather_ops.int8_scaled_mm` over the model cells of the int8 ConvRot plan.
 
 Every cell is (M, N_w, K_w) where N_w/K_w are the weight's output/input axes. The forward contracts K_w
 (out = N_w) and the backward contracts N_w (out = K_w), so one cell covers both directions of the same
-weight. Configs are interleaved inside one process and reported as medians, per the noise guidance in
-~/evotensile/docs/noisy_measurements.md.
+weight. Each schedule in `INT8_CONFIGS` is a provider, so they are interleaved and paired against each
+other inside one run. `--heuristic` replaces them with the single schedule `select_int8_config` picks,
+and `--bf16` (on by default) adds the bf16 GEMM this kernel replaces as the control.
 
 Usage:
-    python bench/benchmark_int8_convrot.py                # full sweep
-    python bench/benchmark_int8_convrot.py --dir fwd      # one direction
-    python bench/benchmark_int8_convrot.py --configs 0,3  # subset of the config table
-    python bench/benchmark_int8_convrot.py --rounds 5     # more samples
+    python -m bench.benchmark_int8_convrot.py                  # heuristic + bf16 control, every cell
+    python -m bench.benchmark_int8_convrot.py --all-configs    # every schedule as a provider
+    python -m bench.benchmark_int8_convrot.py --dir fwd --groups krea2,h3
+    python -m bench.benchmark_int8_convrot.py --configs 0,3    # a subset of the schedule table
 """
 
 import argparse
-import statistics
 
 import torch
-import triton
 
+from bench.protocol import Case, add_protocol_args, run_cases
 from feather_ops.int8_convrot import INT8_CONFIGS, int8_scaled_mm, prepack_int8_convrot_weight, select_int8_config
 
 # (name, [(M, N_w, K_w), ...])
@@ -45,84 +45,69 @@ DEV = "cuda"
 DTYPE = torch.bfloat16
 
 
-def make_inputs(M, N_w, K_w, seed=0):
-    gen = torch.Generator(device=DEV).manual_seed(seed)
+def build_case(M: int, N_w: int, K_w: int, transposed_b: bool, configs, bf16: bool) -> Case:
+    contraction, n_out = (N_w, K_w) if transposed_b else (K_w, N_w)
+    gen = torch.Generator(device=DEV).manual_seed(0)
     wq = torch.randint(-127, 128, (N_w, K_w), device=DEV, dtype=torch.int8, generator=gen)
-    a_scale = torch.rand(M, device=DEV, dtype=torch.float32, generator=gen) * 0.02 + 1e-4
-    return prepack_int8_convrot_weight(wq), a_scale
-
-
-def time_cell(M, N_w, K_w, config, transposed_b, rounds):
-    contraction, n_out = (N_w, K_w) if transposed_b else (K_w, N_w)
-    packed, a_scale = make_inputs(M, N_w, K_w)
+    packed = prepack_int8_convrot_weight(wq)
     a = torch.randint(-127, 128, (M, contraction), device=DEV, dtype=torch.int8).contiguous()
+    a_scale = torch.rand(M, device=DEV, dtype=torch.float32, generator=gen) * 0.02 + 1e-4
     b_scale = None if transposed_b else (torch.rand(n_out, device=DEV, dtype=torch.float32) * 0.02 + 1e-4)
-    times = []
-    for _ in range(rounds):
-        fn = lambda: int8_scaled_mm(a, packed, a_scale, b_scale, None, DTYPE, transposed_b, config)
-        times.append(triton.testing.do_bench(fn, warmup=20, rep=60))
-    tflops = 2 * M * n_out * contraction / (statistics.median(times) * 1e9)
-    return statistics.median(times), tflops
 
+    providers = {}
+    if bf16:
+        weight = torch.randn(contraction, n_out, device=DEV, dtype=DTYPE)
+        activation = a.to(DTYPE)
+        providers["bf16 gemm"] = lambda activation=activation, weight=weight: activation @ weight
 
-def bf16_reference(M, N_w, K_w, transposed_b):
-    """What the int8 kernel replaces: a bf16 GEMM on the same shapes."""
-    contraction, n_out = (N_w, K_w) if transposed_b else (K_w, N_w)
-    a = torch.randn(M, contraction, device=DEV, dtype=DTYPE)
-    w = torch.randn(contraction, n_out, device=DEV, dtype=DTYPE)
-    ms = triton.testing.do_bench(lambda: a @ w, warmup=20, rep=60)
-    return ms, 2 * M * n_out * contraction / (ms * 1e9)
+    def run(cfg):
+        return lambda: int8_scaled_mm(a, packed, a_scale, b_scale, None, DTYPE, transposed_b, cfg)
+
+    if configs is None:
+        picked = select_int8_config(M, n_out, contraction, transposed_b)
+        providers["hip (heuristic)"] = run(picked)
+    else:
+        for index in configs:
+            providers[f"hip cfg{index}"] = run(INT8_CONFIGS[index])
+
+    direction = "bwd" if transposed_b else "fwd"
+    return Case(f"{direction} {M}x{n_out}x{contraction}", providers, scale=2 * M * n_out * contraction / 1e9)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dir", choices=["fwd", "bwd", "both"], default="both")
-    parser.add_argument("--configs", default="")
-    parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--groups", default="")
-    parser.add_argument("--bf16", action="store_true", help="also time the bf16 GEMM it replaces")
-    parser.add_argument("--verbose", action="store_true", help="print every config for every cell")
-    parser.add_argument("--heuristic", action="store_true", help="time only the schedule select_int8_config picks per cell")
-
+    parser.add_argument("--dir", choices=["fwd", "bwd", "both"], default="fwd")
+    parser.add_argument("--configs", default="", help="comma separated INT8_CONFIGS indices. Default is the heuristic")
+    parser.add_argument("--all-configs", action="store_true", help="every schedule as a provider")
+    parser.add_argument("--groups", default="", help="comma separated cell groups")
+    parser.add_argument("--no-bf16", action="store_true", help="do not time the bf16 GEMM control")
+    add_protocol_args(parser)
     args = parser.parse_args()
 
-    configs = [INT8_CONFIGS[int(i)] for i in args.configs.split(",")] if args.configs else list(INT8_CONFIGS)
-    dirs = [False, True] if args.dir == "both" else [args.dir == "bwd"]
-    groups = [g for g in CELLS if not args.groups or g[0] in args.groups.split(",")]
+    if args.all_configs:
+        configs = list(range(len(INT8_CONFIGS)))
+    elif args.configs:
+        configs = [int(value) for value in args.configs.split(",")]
+    else:
+        configs = None
 
-    print(f"# configs={len(configs)} rounds={args.rounds}")
-    for cfg in configs:
-        wm, wn, uk, rm, rn = cfg
-        print(f"# cfg {cfg} -> block {16 * wm * rm:3d}x{16 * wn * rn:3d} chunk_k {16 * uk:3d} threads {32 * wm * wn}")
-    print(
-        f"{'model':10s} {'dir':4s} {'M':>6s} {'N':>6s} {'K':>6s} {'best cfg':22s} {'ms':>8s} {'TFLOPS':>7s} {'2nd':>22s} {'gap':>6s}"
-        + ("  bf16_TF  int8/bf16" if args.bf16 else "")
+    wanted = {value.strip() for value in args.groups.split(",")} if args.groups else None
+    directions = {"fwd": [False], "bwd": [True], "both": [False, True]}[args.dir]
+    cells = [(M, N_w, K_w) for name, group in CELLS if wanted is None or name in wanted for M, N_w, K_w in group]
+
+    cases = [build_case(M, N_w, K_w, transposed_b, configs, not args.no_bf16) for transposed_b in directions for M, N_w, K_w in cells]
+    run_cases(
+        cases,
+        unit="TFLOPS",
+        control="bf16 gemm" if not args.no_bf16 else None,
+        warmup=args.warmup,
+        rounds=args.rounds,
+        target_ms=args.target_ms,
+        cold=args.cold,
+        json_path=args.json_path,
     )
-
-    for name, cells in groups:
-        for M, N_w, K_w in cells:
-            for transposed_b in dirs:
-                results = {}
-                cell_configs = [select_int8_config(M, N_w, K_w, transposed_b)] if args.heuristic else configs
-                for cfg in cell_configs:
-                    ms, tflops = time_cell(M, N_w, K_w, cfg, transposed_b, args.rounds)
-                    results[cfg] = (ms, tflops)
-                ranked = sorted(results.items(), key=lambda kv: kv[1][0])
-                if args.verbose:
-                    detail = "  ".join(f"{cfg[0]}x{cfg[1]}r{cfg[3]}x{cfg[4]}u{cfg[2]}={tf:.3f}" for cfg, (_ms, tf) in ranked)
-                    print(f"# {name} {'bwd' if transposed_b else 'fwd'} {M}x{N_w}x{K_w}: {detail}", flush=True)
-                best_cfg, (best_ms, best_tf) = ranked[0]
-                if len(ranked) > 1:
-                    second_cfg, (second_ms, _) = ranked[1]
-                    second_txt = f"{second_cfg!s:22s} {second_ms / best_ms:.3f}"
-                else:
-                    second_txt = f"{'-':22s} {'-':>6s}"
-                line = f"{name:10s} {'bwd' if transposed_b else 'fwd':4s} {M:6d} {N_w:6d} {K_w:6d} {best_cfg!s:22s} {best_ms:.3f} {best_tf:.3f} {second_txt}"
-                if args.bf16:
-                    bf_ms, bf_tf = bf16_reference(M, N_w, K_w, transposed_b)
-                    line += f"  {bf_tf:.3f}  {bf_ms / best_ms:.3f}x"
-                print(line, flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    with torch.inference_mode():
+        main()

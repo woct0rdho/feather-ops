@@ -11,9 +11,9 @@ def scaled_mm_naive(
     bias_dim: int = 1,
 ) -> torch.Tensor:
     if b_prepacked:
-        # (K/16, N, 16) -> (K, N)
+        # (K_pad/16, N, 16) -> (K, N). The prepack zero-pads K to a multiple of 128
         k, N, _ = b.shape
-        b = b.permute(0, 2, 1).reshape(k * 16, N)
+        b = b.permute(0, 2, 1).reshape(k * 16, N)[: a.shape[1]]
     if bias_dim not in {0, 1}:
         raise RuntimeError(f"bias_dim must be 0 or 1, got {bias_dim}")
 
