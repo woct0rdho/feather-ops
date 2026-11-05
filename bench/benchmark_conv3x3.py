@@ -19,7 +19,8 @@ import torch.nn.functional as F
 
 import feather_ops
 from bench.protocol import Case, add_protocol_args, run_cases
-from feather_ops.conv2d import SUPPORTED_TILES, _select_config, prepack_conv2d_weight_3x3
+from feather_ops.conv2d import prepack_conv2d_weight_3x3, select_conv3x3_config
+from feather_ops.tiles import CONV_TILES, conv_block_sizes
 
 torch.set_grad_enabled(False)
 
@@ -42,7 +43,15 @@ DEFAULT_SHAPES = [
 ]
 
 
-def build_case(c_out: int, k: int, n: int, dtype: torch.dtype, configs) -> Case:
+def _tile_from_text(text: str) -> tuple[int, int, int, int, int]:
+    values = [int(value) for value in text.split(",")]
+    assert len(values) == 5, f"a tile is five ints (warps_m, warps_n, repeat_m, repeat_n, rows), got {text!r}"
+    tile = (values[0], values[1], values[2], values[3], values[4])
+    assert tile in CONV_TILES, f"not instantiated: {tile}"
+    return tile
+
+
+def build_case(c_out: int, k: int, n: int, dtype: torch.dtype, tiles: list[tuple[int, int, int, int, int]], variants: str) -> Case:
     c_in = k // 9
     side = round(n**0.5)
     h = w = side
@@ -60,19 +69,22 @@ def build_case(c_out: int, k: int, n: int, dtype: torch.dtype, configs) -> Case:
         torch.backends.cudnn.enabled = True
         F.conv2d(x, weight, bias, 1, 1)
 
+    def hip(tile, prefetch=None):
+        return lambda: feather_ops.conv3x3_prepacked(x, packed, bias, tile=tile, prefetch=prefetch)
+
     providers = {"torch_im2col": conv_im2col, "torch_miopen": conv_miopen}
-    auto = _select_config(c_out, w)
-    tiles = [auto] if auto else []
-    if configs is not None:
-        tiles = [(*c, 1) for c in configs if c in SUPPORTED_TILES] + ([auto] if auto and auto not in [(*c, 1) for c in configs] else [])
-    for block_m, block_n, rows in tiles:
-        providers[f"hip {block_m}x{block_n}x{rows}"] = lambda bm=block_m, bn=block_n, r=rows: feather_ops.conv3x3_prepacked(x, packed, bias, bm, bn, rows=r)
+    for tile in tiles:
+        name = f"hip {conv_block_sizes(tile)}"
+        providers[name] = hip(tile)
+        if variants == "both":
+            providers[f"{name} prefetch=off"] = hip(tile, False)
+            providers[f"{name} prefetch=on"] = hip(tile, True)
 
     return Case(f"C_out={c_out} C_in={c_in} {h}x{w}", providers, scale=2.0 * c_in * c_out * 9 * h * w / 1e9)
 
 
-def check(case: Case, c_out: int, k: int, n: int, dtype: torch.dtype, configs) -> None:
-    """Print the relative L2 error of every hip tile against a float64 conv2d."""
+def check(case: Case, c_out: int, k: int, n: int, dtype: torch.dtype) -> None:
+    """Print the relative L2 error of every hip provider against a float64 conv2d."""
     c_in = k // 9
     side = round(n**0.5)
     x = torch.randn((1, c_in, side, side), device="cuda", dtype=torch.float32).to(dtype)
@@ -83,30 +95,37 @@ def check(case: Case, c_out: int, k: int, n: int, dtype: torch.dtype, configs) -
     for name in case.providers:
         if not name.startswith("hip"):
             continue
-        block_m, block_n, rows = (int(v) for v in name.removeprefix("hip ").split("x"))
-        out = feather_ops.conv3x3_prepacked(x, packed, bias, block_m, block_n, rows=rows)
+        out = feather_ops.conv3x3_prepacked(x, packed, bias)
         rel = float((out.double() - ref).norm() / ref.norm())
-        print(f"    {name:16s} rel={rel:.1e}")
+        print(f"    {name:26s} rel={rel:.1e}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--shapes", default="")
-    ap.add_argument("--configs", default="")
-    ap.add_argument("--check", action="store_true", help="also print the float64 relative error per tile")
+    ap.add_argument("--tiles", default="", help="wm,wn,rm,rn,rows;... (default: the heuristic's tile per shape)")
+    ap.add_argument("--variants", choices=["auto", "both"], default="auto", help="'both' adds prefetch=off/on per tile")
+    ap.add_argument("--check", action="store_true", help="also print the float64 relative error per shape")
     add_protocol_args(ap)
     args = ap.parse_args()
 
     dtype = getattr(torch, args.dtype)
     shapes = [(m, k, n) for m, k, n in (tuple(int(v) for v in token.split("x")) for token in args.shapes.split(","))] if args.shapes else DEFAULT_SHAPES
-    configs = [tuple(int(v) for v in token.split(",")) for token in args.configs.split(";")] if args.configs else None
+    explicit = [_tile_from_text(token) for token in args.tiles.split(";")] if args.tiles else None
 
-    cases = [build_case(c_out, k, n, dtype, configs) for c_out, k, n in shapes]
+    cases = []
+    for c_out, k, n in shapes:
+        if explicit is not None:
+            cases.append(build_case(c_out, k, n, dtype, explicit, args.variants))
+            continue
+        tile = select_conv3x3_config(c_out, round(n**0.5))
+        assert tile is not None, f"C_out={c_out} W={round(n**0.5)} has no tile"
+        cases.append(build_case(c_out, k, n, dtype, [tile], args.variants))
     if args.check:
         for case, (c_out, k, n) in zip(cases, shapes):
             print(f"== {case.label}")
-            check(case, c_out, k, n, dtype, configs)
+            check(case, c_out, k, n, dtype)
     records = run_cases(
         cases,
         unit="TFLOPS",

@@ -39,6 +39,7 @@
 #pragma clang diagnostic pop
 #endif
 
+#include "feather_tiles.h"
 #include <cstdint>
 #include <optional>
 
@@ -506,110 +507,69 @@ bool launch_one(
     return true;
 }
 
-// Instantiation list: one entry per supported (kBlockM, kBlockN) tile, first match wins. Tiles are
-// ordered widest-first per block_m so a tile lookup is one pass of constant comparisons.
-#define FEATHER_CONV_CONFIGS(X, X_PF)                                               \
-    X_PF(4, 4, 2, 4)  /* 128 x 256, next-group register prefetch */                 \
-    X(4, 4, 2, 4)  /* 128 x 256 */                                                  \
-    X(4, 4, 2, 3)  /* 128 x 192 */                                                  \
-    X(4, 4, 2, 2)  /* 128 x 128 */                                                  \
-    X(4, 2, 2, 3)  /* 128 x  96 */                                                  \
-    X(8, 2, 1, 2)  /* 128 x  64 */                                                  \
-    X(8, 1, 1, 2)  /* 128 x  32 */                                                  \
-    X(3, 8, 2, 2)  /*  96 x 256 */                                                  \
-    X(3, 4, 2, 3)  /*  96 x 192 */                                                  \
-    X(3, 4, 2, 2)  /*  96 x 128 */                                                  \
-    X(3, 3, 2, 2)  /*  96 x  96 */                                                  \
-    X(3, 2, 2, 2)  /*  96 x  64 */                                                  \
-    X(3, 1, 2, 2)  /*  96 x  32 */                                                  \
-    X(2, 8, 2, 2)  /*  64 x 256 */                                                  \
-    X(2, 4, 2, 3)  /*  64 x 192 */                                                  \
-    X(2, 4, 2, 2)  /*  64 x 128 */                                                  \
-    X(2, 2, 2, 3)  /*  64 x  96 */                                                  \
-    X(2, 2, 2, 2)  /*  64 x  64 */                                                  \
-    X(4, 1, 1, 2)  /*  64 x  32 */                                                  \
-    X(1, 8, 3, 2)  /*  48 x 256 */                                                  \
-    X(1, 4, 3, 3)  /*  48 x 192 */                                                  \
-    X(1, 4, 3, 2)  /*  48 x 128 */                                                  \
-    X(1, 2, 3, 3)  /*  48 x  96 */                                                  \
-    X(1, 2, 3, 2)  /*  48 x  64 */                                                  \
-    X(1, 1, 3, 2)  /*  48 x  32 */                                                  \
-    X(2, 8, 1, 2)  /*  32 x 256 */                                                  \
-    X(2, 4, 1, 3)  /*  32 x 192 */                                                  \
-    X(2, 4, 1, 2)  /*  32 x 128 */                                                  \
-    X(2, 3, 1, 2)  /*  32 x  96 */                                                  \
-    X(2, 2, 1, 2)  /*  32 x  64 */                                                  \
-    X(2, 1, 1, 2)  /*  32 x  32 */                                                  \
-    X(1, 8, 1, 2)  /*  16 x 256 */                                                  \
-    X(1, 4, 1, 3)  /*  16 x 192 */                                                  \
-    X(1, 4, 1, 2)  /*  16 x 128 */                                                  \
-    X(1, 3, 1, 2)  /*  16 x  96 */                                                  \
-    X(1, 2, 1, 2)  /*  16 x  64 */                                                  \
-    X(1, 1, 1, 2)  /*  16 x  32 */
-
-// Two output rows per block: only the tiles where the single-row form is M-narrow (a 128-wide
-// image, or a C_out that no 128-wide tile divides) and where the doubled accumulator set still fits
-// in 128-192 VGPRs. Everything else keeps one row: at 128x256 the accumulators would not fit.
-#define FEATHER_CONV_CONFIGS_2ROWS(X)                                               \
-    X(4, 4, 2, 2)  /* 128 x 128 x 2 rows, 16 waves */                               \
-    X(2, 8, 2, 2)  /*  64 x 256 x 2 rows, 16 waves */
-
 } // namespace
 
-// block_m / block_n / rows select the tile. The first instantiation with that shape wins. Returns
-// 0 on success, 1 if no instantiation exists for the tile or the problem does not fit it.
-extern "C" int feather_conv3x3_launch(
-    const void* x, const void* wp, const void* bias, void* y,
-    int B, int C_in, int C_out, int H, int W, int has_bias,
-    int block_m, int block_n, int is_bf16, int rows, void* stream_ptr)
-{
-    hipStream_t stream = reinterpret_cast<hipStream_t>(stream_ptr);
-#define FEATHER_CONV_TRY_2ROWS(WM, WN, RM, RN)                                                                                       \
-    if (rows == 2 && block_m == kWmmaM * WM * RM && block_n == kWmmaN * WN * RN) {                                                   \
-        if (is_bf16) {                                                                                                               \
-            if (launch_one<true, WM, WN, RM, RN, false, 2, true>(x, wp, bias, y, B, C_in, C_out, H, W, has_bias, stream)) return 0;  \
-        } else {                                                                                                                     \
-            if (launch_one<false, WM, WN, RM, RN, false, 2, true>(x, wp, bias, y, B, C_in, C_out, H, W, has_bias, stream)) return 0; \
-        }                                                                                                                            \
-        return 1;                                                                                                                    \
-    }
-    if (rows != 1) {
-        // The two-row instantiations stage pixel pairs with 32-bit loads, which needs an even W
-        // (guaranteed by the tile selector, since block_n >= 32 divides W). An odd W reached
-        // through an explicit tile just falls through to the single-row form: same result, since
-        // the per-pixel reduction order does not depend on the tiling.
-        if ((W & 1) == 0) {
-            FEATHER_CONV_CONFIGS_2ROWS(FEATHER_CONV_TRY_2ROWS)
+// A tile is (warps_m, warps_n, repeat_m, repeat_n, rows). The first instantiation that matches wins.
+// `prefetch` and the dtype are runtime choices so the caller (and therefore the tuning heuristic and the
+// benchmark) decides them per call instead of the kernel deciding for it.
+struct ConvArgs {
+    const void* x;
+    const void* wp;
+    const void* bias;
+    void* y;
+    int B;
+    int C_in;
+    int C_out;
+    int H;
+    int W;
+    int has_bias;
+    int warps_m;
+    int warps_n;
+    int repeat_m;
+    int repeat_n;
+    int rows;
+    int is_bf16;
+    int prefetch;
+    hipStream_t stream;
+};
+
+template <bool kIsBf16, int kWarpsM, int kWarpsN, int kRepeatM, int kRepeatN, int kRows>
+int launch_tile(const ConvArgs& args) {
+    // The two-row instantiations stage pixel pairs with 32-bit loads, which needs an even W. The tile
+    // selector only returns a two-row tile for such a shape. Anything else is a caller error.
+    if constexpr (kRows == 2) {
+        if ((args.W & 1) != 0) {
             return 1;
         }
     }
-#undef FEATHER_CONV_TRY_2ROWS
-#define FEATHER_CONV_TRY(WM, WN, RM, RN)                                                                             \
-    if (block_m == kWmmaM * WM * RM && block_n == kWmmaN * WN * RN) {                                                \
-        if (is_bf16) {                                                                                               \
-            if (launch_one<true, WM, WN, RM, RN>(x, wp, bias, y, B, C_in, C_out, H, W, has_bias, stream)) return 0;  \
-        } else {                                                                                                     \
-            if (launch_one<false, WM, WN, RM, RN>(x, wp, bias, y, B, C_in, C_out, H, W, has_bias, stream)) return 0; \
-        }                                                                                                            \
-        return 1;                                                                                                    \
+    constexpr bool kPairLoads = kRows == 2;
+    const bool launched = args.prefetch != 0
+        ? launch_one<kIsBf16, kWarpsM, kWarpsN, kRepeatM, kRepeatN, true, kRows, kPairLoads>(
+              args.x, args.wp, args.bias, args.y, args.B, args.C_in, args.C_out, args.H, args.W, args.has_bias, args.stream)
+        : launch_one<kIsBf16, kWarpsM, kWarpsN, kRepeatM, kRepeatN, false, kRows, kPairLoads>(
+              args.x, args.wp, args.bias, args.y, args.B, args.C_in, args.C_out, args.H, args.W, args.has_bias, args.stream);
+    return launched ? 0 : 1;
+}
+
+template <int kWarpsM, int kWarpsN, int kRepeatM, int kRepeatN, int kRows>
+int launch_tile_any_dtype(const ConvArgs& args) {
+    return args.is_bf16 != 0 ? launch_tile<true, kWarpsM, kWarpsN, kRepeatM, kRepeatN, kRows>(args)
+                             : launch_tile<false, kWarpsM, kWarpsN, kRepeatM, kRepeatN, kRows>(args);
+}
+
+// Returns 0 on success, 1 if no instantiation exists for the tile or the problem does not fit it.
+extern "C" int feather_conv3x3_launch(
+    const void* x, const void* wp, const void* bias, void* y,
+    int B, int C_in, int C_out, int H, int W, int has_bias,
+    int warps_m, int warps_n, int repeat_m, int repeat_n, int rows, int is_bf16, int prefetch, void* stream_ptr)
+{
+    const ConvArgs args{x, wp, bias, y, B, C_in, C_out, H, W, has_bias, warps_m, warps_n, repeat_m, repeat_n, rows,
+                        is_bf16, prefetch, reinterpret_cast<hipStream_t>(stream_ptr)};
+#define FEATHER_CONV_TRY(WM, WN, RM, RN, ROWS) \
+    if (rows == (ROWS) && warps_m == (WM) && warps_n == (WN) && repeat_m == (RM) && repeat_n == (RN)) { \
+        return launch_tile_any_dtype<WM, WN, RM, RN, ROWS>(args); \
     }
-    // The next-group prefetch only pays for the 16-wave 128x256 tile with enough groups to hide
-    // behind, so it is gated on both.
-    const bool use_prefetch = block_n == 256 && block_m == 128 && C_in >= 128;
-#define FEATHER_CONV_TRY_PF(WM, WN, RM, RN)                                                                                \
-    if (use_prefetch && block_m == kWmmaM * WM * RM && block_n == kWmmaN * WN * RN) {                                      \
-        if (is_bf16) {                                                                                                     \
-            if (launch_one<true, WM, WN, RM, RN, true>(x, wp, bias, y, B, C_in, C_out, H, W, has_bias, stream)) return 0;  \
-        } else {                                                                                                           \
-            if (launch_one<false, WM, WN, RM, RN, true>(x, wp, bias, y, B, C_in, C_out, H, W, has_bias, stream)) return 0; \
-        }                                                                                                                  \
-        return 1;                                                                                                          \
-    }
-#define FEATHER_CONV_SKIP(...)
-    FEATHER_CONV_CONFIGS(FEATHER_CONV_SKIP, FEATHER_CONV_TRY_PF)
-    FEATHER_CONV_CONFIGS(FEATHER_CONV_TRY, FEATHER_CONV_SKIP)
-#undef FEATHER_CONV_SKIP
-#undef FEATHER_CONV_TRY_PF
+    FEATHER_CONV_TILES(FEATHER_CONV_TRY)
 #undef FEATHER_CONV_TRY
     return 1;
 }
@@ -622,9 +582,12 @@ void conv2d_3x3(
     const torch::stable::Tensor& w_prepacked,
     const std::optional<torch::stable::Tensor>& bias,
     torch::stable::Tensor& out,
-    const int64_t block_m,
-    const int64_t block_n,
-    const int64_t rows)
+    const int64_t warps_m,
+    const int64_t warps_n,
+    const int64_t repeat_m,
+    const int64_t repeat_n,
+    const int64_t rows,
+    const bool prefetch)
 {
     STD_TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
     STD_TORCH_CHECK(w_prepacked.is_cuda(), "w_prepacked must be a CUDA tensor");
@@ -693,10 +656,12 @@ void conv2d_3x3(
         static_cast<int>(B), static_cast<int>(C_in), static_cast<int>(C_out),
         static_cast<int>(H), static_cast<int>(W),
         bias.has_value() ? 1 : 0,
-        static_cast<int>(block_m), static_cast<int>(block_n),
+        static_cast<int>(warps_m), static_cast<int>(warps_n), static_cast<int>(repeat_m), static_cast<int>(repeat_n),
+        static_cast<int>(rows),
         dtype == torch::stable::ScalarType::BFloat16 ? 1 : 0,
-        static_cast<int>(rows), stream) == 0;
-    STD_TORCH_CHECK(launched, "conv2d_3x3: unsupported tile ", block_m, "x", block_n, " rows ", rows);
+        prefetch ? 1 : 0, stream) == 0;
+    STD_TORCH_CHECK(launched, "conv2d_3x3: unsupported tile ", warps_m, "x", warps_n, " warp, ", repeat_m, "x", repeat_n,
+                    " repeat, ", rows, " rows");
 
     const hipError_t launch_err = hipGetLastError();
     STD_TORCH_CHECK(launch_err == hipSuccess, "conv2d_3x3 kernel launch failed: ", hipGetErrorString(launch_err));
@@ -712,9 +677,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(feather_ops, m)
         "Tensor w_prepacked, "
         "Tensor? bias, "
         "Tensor(a!) out, "
-        "int block_m, "
-        "int block_n, "
-        "int rows"
+        "int warps_m, "
+        "int warps_n, "
+        "int repeat_m, "
+        "int repeat_n, "
+        "int rows, "
+        "bool prefetch"
         ") -> ()");
 }
 

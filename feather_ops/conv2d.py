@@ -20,30 +20,30 @@ import weakref
 
 import torch
 import torch.nn.functional as F
+from torch.library import custom_op
 
-# The kernel's tile vocabulary: (block_m, block_n) = (channels x pixels) output tile. Not part of the
-# package API - it is the data behind `conv3x3_prepacked`'s explicit block_m/block_n arguments, and
-# the tests pin it against the C++ instantiation list.
-SUPPORTED_TILES = frozenset((block_m, block_n) for block_m in (128, 96, 64, 48, 32, 16) for block_n in (256, 192, 128, 96, 64, 32))
+from .tiles import CONV_PREFETCH_MIN_C_IN, CONV_TILES, MIOPEN_FP16_MAX_INPUT_ELEMS, conv_block_sizes
 
-# Largest exact divisor wins: a tile that does not divide the extent makes the last block recompute
-# overlapping rows/columns (correct but wasteful), and C_out is the expensive axis to waste.
-_BLOCK_MS = (128, 96, 64, 48, 32, 16)
-_BLOCK_NS = (256, 192, 128, 96, 64, 32)
+# `(block_m, block_n) -> tile` for the one-row instantiations, which is the vocabulary the selector below
+# reasons in. The two-row tiles are the same box with a different `rows`.
+_TILES_ONE_ROW = {(conv_block_sizes(tile)[0], conv_block_sizes(tile)[1]): tile for tile in CONV_TILES if tile[4] == 1}
+_TILES_TWO_ROWS = {(conv_block_sizes(tile)[0], conv_block_sizes(tile)[1]): tile for tile in CONV_TILES if tile[4] == 2}
+_BLOCK_MS = tuple(sorted({block_m for block_m, _ in _TILES_ONE_ROW}, reverse=True))
+_BLOCK_NS = tuple(sorted({block_n for _, block_n in _TILES_ONE_ROW}, reverse=True))
 
 
-def _select_config(c_out: int, width: int) -> tuple[int, int, int] | None:
-    """`(block_m, block_n, rows)` for one convolution, or None if no instantiation fits.
+def select_conv3x3_config(c_out: int, width: int) -> tuple[int, int, int, int, int] | None:
+    """`(warps_m, warps_n, repeat_m, repeat_n, rows)` for one convolution, or None if no tile fits.
 
-    The largest `block_m` dividing `c_out` wins, then the largest `block_n` dividing `width`, else
-    the largest `block_n` that merely fits - the last column block then overlaps its neighbour and
-    recomputes those columns with the same reduction order, so the duplicate stores are identical.
+    The largest `block_m` dividing `c_out` wins, then the largest `block_n` dividing `width`, else the
+    largest `block_n` that merely fits - the last column block then overlaps its neighbour and recomputes
+    those columns with the same reduction order, so the duplicate stores are identical.
 
-    `rows` is how many output rows one block computes. Two rows stage a 4-row halo for 2 output
-    rows, which drops the input re-read from about three times to about twice per output row and
-    halves the per-block staging and epilogue work, at the cost of doubling the accumulators. That
-    only fits where the single-row tile is narrow in `C_out` (a 128-wide image, or a `C_out` that no
-    128-wide tile divides), which is exactly where it is selected.
+    `rows` is how many output rows one block computes. Two rows stage a 4-row halo for 2 output rows,
+    which drops the input re-read from about three times to about twice per output row and halves the
+    per-block staging and epilogue work, at the cost of doubling the accumulators. That only fits where
+    the single-row tile is narrow in `C_out` (a 128-wide image, or a `C_out` that no 128-wide tile
+    divides), which is exactly where it is selected.
     """
     for block_m in _BLOCK_MS:
         if c_out % block_m:
@@ -54,20 +54,26 @@ def _select_config(c_out: int, width: int) -> tuple[int, int, int] | None:
             if not block_n:
                 return None
         if block_n == 128 and c_out % 128 == 0:
-            # A 128-wide image leaves the single-row tile without enough work per block, so the
-            # two-row variant is the better trade there.
-            return 128, 128, 2
+            return _TILES_TWO_ROWS[(128, 128)]
         if block_n == 256 and c_out % 128 and c_out % 64 == 0:
-            # C_out that cannot fill a 128-wide block (192, 576, ...): the narrower 64-wide tile
-            # halves the accumulator pressure, which is what makes the two-row variant fit.
-            return 64, 256, 2
-        return block_m, block_n, 1
+            return _TILES_TWO_ROWS[(64, 256)]
+        return _TILES_ONE_ROW[(block_m, block_n)]
     return None
 
 
-# MIOpen's fp16 Winograd wins while the whole input fits in a small multiple of the last-level cache
-# footprint (c_in * H * W elements) and starts to lose once the activation stream is cache-cold.
-_MIOPEN_FP16_MAX_INPUT_ELEMS = 1 << 28
+def conv3x3_prefetch(tile: tuple[int, int, int, int, int], c_in: int) -> bool:
+    """Whether to prefetch the next channel group into registers.
+
+    The prefetch hides the next group's global load behind this group's compute, so it needs enough groups
+    and a wide enough N panel to pay. Measured per cell (`bench/benchmark_conv3x3.py --variants both`):
+    +3.5 to +7.9% on every `block_n = 256` tile with `C_in >= 128`, +6.1% on the 128x128 two-row tile, and
+    -8 to -9% on the 64x256 two-row tile, which is where the doubled accumulator set leaves no room to
+    preload. The variant is instantiated for every tile, so this is a pure runtime choice.
+    """
+    block_m, block_n, rows = conv_block_sizes(tile)
+    if c_in < CONV_PREFETCH_MIN_C_IN or block_n < 128:
+        return False
+    return not (rows == 2 and block_m == 64)
 
 
 def select_backend(dtype: torch.dtype, c_in: int, c_out: int, height: int, width: int) -> str:
@@ -82,9 +88,9 @@ def select_backend(dtype: torch.dtype, c_in: int, c_out: int, height: int, width
     stream goes cache-cold and the kernel takes over. bf16 is never delegated: MIOpen has no bf16
     Winograd, and its best bf16 path is slower than this kernel.
     """
-    if dtype == torch.float16 and c_in * height * width <= _MIOPEN_FP16_MAX_INPUT_ELEMS:
+    if dtype == torch.float16 and c_in * height * width <= MIOPEN_FP16_MAX_INPUT_ELEMS:
         return "miopen"
-    if dtype in (torch.bfloat16, torch.float16) and _select_config(c_out, width) is not None:
+    if dtype in (torch.bfloat16, torch.float16) and select_conv3x3_config(c_out, width) is not None:
         return "kernel"
     return "torch"
 
@@ -148,30 +154,43 @@ def prepack_conv2d_weight_3x3(weight: torch.Tensor) -> torch.Tensor:
     return w.view(groups * 18, 8, c_out).permute(0, 2, 1).contiguous()
 
 
+def _launch(
+    x: torch.Tensor,
+    w_packed: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+    tile: tuple[int, int, int, int, int],
+    prefetch: bool,
+) -> None:
+    torch.ops.feather_ops.conv2d_3x3.default(x, w_packed, bias, out, *tile, prefetch)
+
+
+@custom_op("feather_ops::conv3x3_auto", mutates_args=("out",))
+def _conv3x3_auto(x: torch.Tensor, w_packed: torch.Tensor, bias: torch.Tensor | None, out: torch.Tensor) -> None:
+    """The tile and prefetch heuristics behind an opaque boundary, so a compiled caller sees one node."""
+    tile = select_conv3x3_config(w_packed.shape[1], x.shape[3])
+    if tile is None:
+        raise RuntimeError(f"no kernel tile for C_out={w_packed.shape[1]} W={x.shape[3]}")
+    _launch(x, w_packed, bias, out, tile, conv3x3_prefetch(tile, x.shape[1]))
+
+
 def conv3x3_prepacked(
     x: torch.Tensor,
     w_packed: torch.Tensor,
     bias: torch.Tensor | None = None,
-    block_m: int | None = None,
-    block_n: int | None = None,
-    rows: int | None = None,
+    tile: tuple[int, int, int, int, int] | None = None,
+    prefetch: bool | None = None,
 ) -> torch.Tensor:
     """3x3, stride 1, padding 1 conv over a prepacked weight. No fall back, no checking of extras.
 
-    `C_in` must be a multiple of 8. It need not be a multiple of 16 (the prepack zero pads).
-    An explicit `block_m`/`block_n` pins the tile and defaults to one output row per block.
+    `C_in` must be a multiple of 8. It need not be a multiple of 16 (the prepack zero pads). `tile` and
+    `prefetch` default to the heuristics. They exist so a benchmark or a test can pin them.
     """
-    if block_m is None or block_n is None:
-        config = _select_config(w_packed.shape[1], x.shape[3])
-        if config is None:
-            raise RuntimeError(f"no kernel tile for C_out={w_packed.shape[1]} W={x.shape[3]}")
-        block_m, block_n, rows = config
-    elif rows is None:
-        rows = 1
     out = torch.empty((x.shape[0], w_packed.shape[1], x.shape[2], x.shape[3]), device=x.device, dtype=x.dtype)
-    # The native op is an out= op that returns nothing, so it needs no fake kernel and the buffer
-    # allocated above stays visible to the compiler.
-    torch.ops.feather_ops.conv2d_3x3.default(x, w_packed, bias, out, block_m, block_n, rows)
+    if tile is None:
+        _conv3x3_auto(x, w_packed, bias, out)
+    else:
+        _launch(x, w_packed, bias, out, tile, conv3x3_prefetch(tile, x.shape[1]) if prefetch is None else prefetch)
     return out
 
 

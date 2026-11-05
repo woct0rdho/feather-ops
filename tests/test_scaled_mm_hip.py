@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from feather_ops import scaled_mm
 from feather_ops.naive import scaled_mm_naive
-from feather_ops.scaled_mm import SCALED_MM_TILES, prepack_b_for_scaled_mm, scaled_mm_hip, scaled_mm_hip_configured
+from feather_ops.scaled_mm import prepack_b_for_scaled_mm, scaled_mm_hip
+from feather_ops.tiles import SCALED_MM_TILES
 
 RTOL = 0.01
 ATOL = {
@@ -38,10 +38,7 @@ def _tensor(shape, dtype, seed=0):
 
 
 def _check(a, b_prepacked, scale, bias, out_dtype, tile=None):
-    if tile is None:
-        out = scaled_mm_hip(a, b_prepacked, scale, bias, out_dtype)
-    else:
-        out = scaled_mm_hip_configured(a, b_prepacked, scale, bias, out_dtype, *tile)
+    out = scaled_mm_hip(a, b_prepacked, scale, bias, out_dtype, tile=tile)
     ref = scaled_mm_naive(a, b_prepacked, scale, bias, out_dtype, b_prepacked=True)
     diff = (out.float() - ref.float()).abs()
     rel = (diff.norm() / ref.float().norm().clamp(min=1e-6)).item()
@@ -90,9 +87,3 @@ def test_heuristic_matches_a_measured_tile():
     rel, max_abs = _check(a, b_prepacked, scale, None, torch.bfloat16)
     assert rel <= RTOL
     assert max_abs <= ATOL[torch.bfloat16]
-
-
-def test_heuristic_shapes_are_instantiated():
-    for name in dir(scaled_mm):
-        if name.startswith("_SHAPE_"):
-            assert getattr(scaled_mm, name) in SCALED_MM_TILES, f"{name} is not instantiated in the kernel"

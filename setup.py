@@ -2,12 +2,16 @@ import importlib.util
 import os
 import shlex
 import shutil
+import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
 from torch.utils import cpp_extension
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+import tools.gen_tiles as _gen_tiles
+
 CSRC = ROOT / "csrc"
 SOURCES = [
     "csrc/extension.cpp",
@@ -107,6 +111,11 @@ hip_flags = [
 if os.name == "nt":
     # ROCm's injected HIP wrapper pulls in MSVC <cmath> too early on Windows.
     hip_flags.append("-nohipwrapperinc")
+
+# The tile tables in feather_ops/tiles.py are what the kernels are instantiated from, so the header is
+# regenerated on every build. `python tools/gen_tiles.py --check` (run by tests/test_tiles.py) catches a
+# hand-edited header.
+_gen_tiles.HEADER.write_text(_gen_tiles.render())
 
 setup(
     # `package_dir` maps the root package to the repository root, which makes the layout

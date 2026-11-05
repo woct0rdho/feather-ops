@@ -13,6 +13,8 @@
 #pragma clang diagnostic pop
 #endif
 
+#include "feather_tiles.h"
+
 #include <cstdint>
 #include <optional>
 #include <type_traits>
@@ -460,55 +462,12 @@ extern "C" bool launch_int8_scaled_mm(
         return true;
     };
 
-    // (warps_m, warps_n, unroll_k, repeat_m, repeat_n, transposed_b)
-    return
-        // forward: C = A @ W^T
-        try_launch(Int8ConfigTag<1, 1, 2, 1, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 2, 2, 1, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 4, 2, 1, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 8, 2, 1, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 1, 4, 1, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 2, 4, 1, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 4, 4, 1, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 8, 4, 1, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 2, 2, 2, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 4, 2, 2, 2, false>{}) ||
-        try_launch(Int8ConfigTag<2, 2, 2, 2, 2, false>{}) ||
-        try_launch(Int8ConfigTag<2, 4, 2, 2, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 4, 2, 4, 2, false>{}) ||
-        try_launch(Int8ConfigTag<1, 8, 2, 4, 2, false>{}) ||
-        try_launch(Int8ConfigTag<2, 2, 2, 4, 4, false>{}) ||
-        try_launch(Int8ConfigTag<2, 4, 2, 4, 4, false>{}) ||
-        try_launch(Int8ConfigTag<4, 2, 2, 4, 4, false>{}) ||
-        try_launch(Int8ConfigTag<2, 4, 4, 4, 4, false>{}) ||
-        try_launch(Int8ConfigTag<2, 2, 4, 4, 2, false>{}) ||
-        try_launch(Int8ConfigTag<2, 4, 2, 4, 2, false>{}) ||
-        try_launch(Int8ConfigTag<2, 8, 2, 4, 2, false>{}) ||
-        try_launch(Int8ConfigTag<4, 4, 2, 4, 4, false>{}) ||
-        // backward: C = A @ W (contraction along the weight's output axis)
-        try_launch(Int8ConfigTag<1, 1, 2, 1, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 2, 2, 1, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 4, 2, 1, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 8, 2, 1, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 1, 4, 1, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 2, 4, 1, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 4, 4, 1, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 8, 4, 1, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 2, 2, 2, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 4, 2, 2, 2, true>{}) ||
-        try_launch(Int8ConfigTag<2, 2, 2, 2, 2, true>{}) ||
-        try_launch(Int8ConfigTag<2, 4, 2, 2, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 4, 2, 4, 2, true>{}) ||
-        try_launch(Int8ConfigTag<1, 8, 2, 4, 2, true>{}) ||
-        try_launch(Int8ConfigTag<2, 2, 2, 4, 4, true>{}) ||
-        try_launch(Int8ConfigTag<2, 4, 2, 4, 4, true>{}) ||
-        try_launch(Int8ConfigTag<4, 2, 2, 4, 4, true>{}) ||
-        try_launch(Int8ConfigTag<2, 4, 4, 4, 4, true>{}) ||
-        try_launch(Int8ConfigTag<2, 2, 4, 4, 2, true>{}) ||
-        try_launch(Int8ConfigTag<2, 4, 2, 4, 2, true>{}) ||
-        try_launch(Int8ConfigTag<2, 8, 2, 4, 2, true>{}) ||
-        try_launch(Int8ConfigTag<4, 4, 2, 4, 4, true>{}) ||
-        false;
+    // (warps_m, warps_n, unroll_k, repeat_m, repeat_n) x (forward, backward), from feather_ops/tiles.py.
+#define FEATHER_INT8_TRY_TILE(m, n, u, rm, rn) \
+    || try_launch(Int8ConfigTag<m, n, u, rm, rn, false>{}) \
+    || try_launch(Int8ConfigTag<m, n, u, rm, rn, true>{})
+    return false FEATHER_INT8_TILES(FEATHER_INT8_TRY_TILE);
+#undef FEATHER_INT8_TRY_TILE
 }
 
 #ifndef NO_PYTORCH

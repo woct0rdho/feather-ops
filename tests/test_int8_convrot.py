@@ -2,13 +2,13 @@ import pytest
 import torch
 
 from feather_ops.int8_convrot import (
-    INT8_CONFIGS,
     convrot_quantize_activation,
     int8_scaled_mm,
     prepack_int8_convrot_weight,
     select_int8_config,
     unpack_int8_convrot_weight,
 )
+from feather_ops.tiles import INT8_TILES
 
 DEV = "cuda"
 RTOL = 0.02  # bf16 output rounding of a scale multiply against an fp64 reference
@@ -128,7 +128,7 @@ def test_model_cells_against_reference(M, N_w, K_w, transposed_b):
     assert _max_rel(got, ref) < RTOL
 
 
-@pytest.mark.parametrize("cfg", INT8_CONFIGS)
+@pytest.mark.parametrize("cfg", INT8_TILES)
 @pytest.mark.parametrize("transposed_b", [False, True])
 def test_every_table_config(cfg, transposed_b):
     warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
@@ -141,11 +141,11 @@ def test_every_table_config(cfg, transposed_b):
     a = _quantized(-127, 128, (M, contraction), seed=13)
     a_scale = _scales(M, seed=14)
     if transposed_b:
-        got = int8_scaled_mm(a, packed, a_scale, None, None, torch.bfloat16, True, cfg)
+        got = int8_scaled_mm(a, packed, a_scale, None, None, torch.bfloat16, True, tile=cfg)
         ref = _reference_dgrad(a, wq, a_scale, torch.bfloat16)
     else:
         w_scale = _scales(out, seed=15)
-        got = int8_scaled_mm(a, packed, a_scale, w_scale, None, torch.bfloat16, False, cfg)
+        got = int8_scaled_mm(a, packed, a_scale, w_scale, None, torch.bfloat16, False, tile=cfg)
         ref = _reference_fwd(a, wq, a_scale, w_scale, None, torch.bfloat16)
     assert _max_rel(got, ref) < RTOL
 
@@ -368,3 +368,20 @@ def test_quantize_output_feeds_the_gemm():
     w_deq = torch.matmul((wq.float() * w_scale[:, None]).reshape(N, K // 256, 256), h).reshape(N, K)
     ref = x.float() @ w_deq.t()
     assert ((got.float() - ref).norm() / ref.norm()).item() < 2e-2
+
+
+def test_compile_is_supported():
+    """The schedule heuristic lives behind an opaque op, so a dynamic graph is one node and matches eager."""
+    torch.manual_seed(0)
+    m, n_w, k_w = 4112, 1152, 1152
+    packed = prepack_int8_convrot_weight(torch.randint(-127, 128, (n_w, k_w), device=DEV, dtype=torch.int8))
+    a = torch.randint(-127, 128, (m, k_w), device=DEV, dtype=torch.int8)
+    a_scale = torch.rand(m, device=DEV, dtype=torch.float32) * 0.02
+    w_scale = torch.rand(n_w, device=DEV, dtype=torch.float32) * 0.02
+
+    def run(a, a_scale):
+        return int8_scaled_mm(a, packed, a_scale, w_scale, None, torch.bfloat16, False)
+
+    eager = run(a, a_scale)
+    compiled = torch.compile(run, fullgraph=True, dynamic=True)(a, a_scale)
+    assert torch.equal(compiled, eager)

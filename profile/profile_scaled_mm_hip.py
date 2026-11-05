@@ -4,7 +4,7 @@ import argparse
 
 import torch
 
-from feather_ops.scaled_mm import prepack_b_for_scaled_mm, scaled_mm_hip_configured
+from feather_ops.scaled_mm import prepack_b_for_scaled_mm, scaled_mm_hip
 
 
 def main():
@@ -29,10 +29,12 @@ def main():
     scale = None if args.no_scale else torch.tensor(2.34, device=device, dtype=torch.float32)
     bias = None if args.no_bias else torch.randn(n, device=device, dtype=torch.float16)
 
-    cfg = tuple(int(x.strip()) for x in args.config.split(","))
+    values = [int(x.strip()) for x in args.config.split(",")]
+    assert len(values) == 5, "--config is warps_m,warps_n,unroll_k,repeat_m,repeat_n"
+    cfg = (values[0], values[1], values[2], values[3], values[4])
 
     def run_fn():
-        return scaled_mm_hip_configured(a, b_prepacked, scale, bias, torch.float16, *cfg)
+        return scaled_mm_hip(a, b_prepacked, scale, bias, torch.float16, tile=cfg)
 
     print("Warming up...")
     for _ in range(3):

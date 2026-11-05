@@ -3,7 +3,7 @@
 
 Every cell is (M, N_w, K_w) where N_w/K_w are the weight's output/input axes. The forward contracts K_w
 (out = N_w) and the backward contracts N_w (out = K_w), so one cell covers both directions of the same
-weight. Each schedule in `INT8_CONFIGS` is a provider, so they are interleaved and paired against each
+weight. Each schedule in `INT8_TILES` is a provider, so they are interleaved and paired against each
 other inside one run. `--heuristic` replaces them with the single schedule `select_int8_config` picks,
 and `--bf16` (on by default) adds the bf16 GEMM this kernel replaces as the control.
 
@@ -19,7 +19,8 @@ import argparse
 import torch
 
 from bench.protocol import Case, add_protocol_args, run_cases
-from feather_ops.int8_convrot import INT8_CONFIGS, int8_scaled_mm, prepack_int8_convrot_weight, select_int8_config
+from feather_ops.int8_convrot import int8_scaled_mm, prepack_int8_convrot_weight, select_int8_config
+from feather_ops.tiles import INT8_TILES
 
 # (name, [(M, N_w, K_w), ...])
 CELLS = [
@@ -60,15 +61,15 @@ def build_case(M: int, N_w: int, K_w: int, transposed_b: bool, configs, bf16: bo
         activation = a.to(DTYPE)
         providers["bf16 gemm"] = lambda activation=activation, weight=weight: activation @ weight
 
-    def run(cfg):
-        return lambda: int8_scaled_mm(a, packed, a_scale, b_scale, None, DTYPE, transposed_b, cfg)
+    def run(tile):
+        return lambda: int8_scaled_mm(a, packed, a_scale, b_scale, None, DTYPE, transposed_b, tile)
 
     if configs is None:
         picked = select_int8_config(M, n_out, contraction, transposed_b)
         providers["hip (heuristic)"] = run(picked)
     else:
         for index in configs:
-            providers[f"hip cfg{index}"] = run(INT8_CONFIGS[index])
+            providers[f"hip cfg{index}"] = run(INT8_TILES[index])
 
     direction = "bwd" if transposed_b else "fwd"
     return Case(f"{direction} {M}x{n_out}x{contraction}", providers, scale=2 * M * n_out * contraction / 1e9)
@@ -77,7 +78,7 @@ def build_case(M: int, N_w: int, K_w: int, transposed_b: bool, configs, bf16: bo
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", choices=["fwd", "bwd", "both"], default="fwd")
-    parser.add_argument("--configs", default="", help="comma separated INT8_CONFIGS indices. Default is the heuristic")
+    parser.add_argument("--configs", default="", help="comma separated INT8_TILES indices. Default is the heuristic")
     parser.add_argument("--all-configs", action="store_true", help="every schedule as a provider")
     parser.add_argument("--groups", default="", help="comma separated cell groups")
     parser.add_argument("--no-bf16", action="store_true", help="do not time the bf16 GEMM control")
@@ -85,7 +86,7 @@ def main():
     args = parser.parse_args()
 
     if args.all_configs:
-        configs = list(range(len(INT8_CONFIGS)))
+        configs = list(range(len(INT8_TILES)))
     elif args.configs:
         configs = [int(value) for value in args.configs.split(",")]
     else:

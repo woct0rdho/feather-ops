@@ -13,32 +13,10 @@ int32` is exact), so it is bit-identical and `unpack_int8_convrot_weight` restor
 """
 
 import torch
-
-# Config format: (block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n), i.e.
-# block_m = 16 * warps_m * repeat_m, block_n = 16 * warps_n * repeat_n, chunk_k = 16 * unroll_k.
-# These must stay in the kernel's table (`launch_int8_scaled_mm` in csrc/hip_kernel_int8.cu). The schedules the
-# heuristic below returns are all members, and tests/test_int8_convrot.py runs every one of them.
-INT8_CONFIGS: list[tuple[int, int, int, int, int]] = [
-    (1, 2, 2, 1, 2),
-    (1, 4, 2, 1, 2),
-    (1, 4, 4, 1, 2),
-    (1, 8, 2, 1, 2),
-    (2, 2, 2, 2, 2),
-    (1, 4, 2, 2, 2),
-    (2, 4, 2, 2, 2),
-    (1, 4, 2, 4, 2),
-    (2, 2, 2, 4, 4),
-    (2, 4, 2, 4, 2),
-    (1, 8, 2, 4, 2),
-    (2, 4, 2, 4, 4),
-    (2, 4, 4, 4, 4),
-    (4, 2, 2, 4, 4),
-    (2, 8, 2, 4, 2),
-    (4, 4, 2, 4, 4),
-]
-
+from torch.library import custom_op
 
 # Tile schedule per role, measured on the model cells of the int8 ConvRot plan (bench/benchmark_int8_convrot.py).
+# Each is a row of `INT8_TILES`. The comment is the (block_m x block_n) box and thread count.
 _TILE_SMALL_M = (2, 2, 2, 2, 2)  # 64x64, 128 threads: 1-256 rows (prefix passes, short text rows)
 _TILE_NARROW = (4, 2, 2, 4, 4)  # 256x128, 256 threads: narrow outputs, where a 256-wide tile is mostly tail
 _TILE_WIDE = (4, 4, 2, 4, 4)  # 256x256, 512 threads: wide outputs, the bulk of the model flops
@@ -142,6 +120,43 @@ def convrot_quantize_activation(
     return q, scale
 
 
+def _launch(
+    a: torch.Tensor,
+    weight_prepacked: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+    transposed_b: bool,
+    tile: tuple[int, int, int, int, int],
+) -> None:
+    torch.ops.feather_ops.int8_scaled_mm.default(
+        a,
+        weight_prepacked.reshape(-1),
+        a_scale.reshape(-1).to(torch.float32),
+        None if weight_scale is None else weight_scale.reshape(-1).to(torch.float32),
+        bias,
+        out,
+        transposed_b,
+        *tile,
+    )
+
+
+@custom_op("feather_ops::int8_scaled_mm_auto", mutates_args=("out",))
+def _int8_scaled_mm_auto(
+    a: torch.Tensor,
+    weight_prepacked: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+    transposed_b: bool,
+) -> None:
+    """The schedule heuristic behind an opaque boundary, so a compiled caller sees one node."""
+    tile = select_int8_config(a.shape[0], weight_prepacked.numel() // a.shape[1], a.shape[1], transposed_b)
+    _launch(a, weight_prepacked, a_scale, weight_scale, bias, out, transposed_b, tile)
+
+
 def int8_scaled_mm(
     a: torch.Tensor,
     weight_prepacked: torch.Tensor,
@@ -150,7 +165,7 @@ def int8_scaled_mm(
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     transposed_b: bool = False,
-    config: tuple[int, int, int, int, int] | None = None,
+    tile: tuple[int, int, int, int, int] | None = None,
 ) -> torch.Tensor:
     """`A @ W^T` (default) or `A @ W` (`transposed_b=True`) with per-row and per-output-channel scales.
 
@@ -164,7 +179,7 @@ def int8_scaled_mm(
         bias: `[N_out]` in `out_dtype`, forward only.
         out_dtype: `torch.bfloat16` or `torch.float16`.
         transposed_b: contract the weight's output axis instead of its input axis.
-        config: override the shape heuristic.
+        tile: pin the schedule instead of using `select_int8_config`.
 
     Returns:
         `[M, N_out]` in `out_dtype`.
@@ -178,16 +193,9 @@ def int8_scaled_mm(
     if transposed_b and weight_scale is not None:
         raise ValueError("transposed_b folds the weight scale into the activation quantization, so weight_scale must be None")
 
-    cfg = config if config is not None else select_int8_config(M, n_out, K, transposed_b)
     out = torch.empty((M, n_out), device=a.device, dtype=out_dtype)
-    torch.ops.feather_ops.int8_scaled_mm.default(
-        a,
-        weight_prepacked.reshape(-1),
-        a_scale.reshape(-1).to(torch.float32),
-        None if weight_scale is None else weight_scale.reshape(-1).to(torch.float32),
-        bias,
-        out,
-        transposed_b,
-        *cfg,
-    )
+    if tile is None:
+        _int8_scaled_mm_auto(a, weight_prepacked, a_scale, weight_scale, bias, out, transposed_b)
+    else:
+        _launch(a, weight_prepacked, a_scale, weight_scale, bias, out, transposed_b, tile)
     return out

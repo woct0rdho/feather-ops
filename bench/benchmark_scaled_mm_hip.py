@@ -19,7 +19,8 @@ import argparse
 import torch
 
 from bench.protocol import Case, add_protocol_args, run_cases
-from feather_ops.scaled_mm import SCALED_MM_TILES, prepack_b_for_scaled_mm, scaled_mm_hip, scaled_mm_hip_configured
+from feather_ops.scaled_mm import prepack_b_for_scaled_mm, scaled_mm_hip
+from feather_ops.tiles import SCALED_MM_TILES
 
 # The forward GEMM cells of the models this kernel serves: one (N, K) family per quantized Linear
 # family, at the M values each model runs. Same table as the fp8 plan document.
@@ -68,7 +69,7 @@ def build_case(family: str, M: int, N: int, K: int, tiles) -> Case:
 
     providers = {"torch_mm": lambda: torch.mm(a, weight.t())}
     for tile in tiles:
-        providers[f"hip {tile}"] = lambda tile=tile: scaled_mm_hip_configured(a, b_prepacked, scale, bias, torch.bfloat16, *tile)
+        providers[f"hip {tile}"] = lambda tile=tile: scaled_mm_hip(a, b_prepacked, scale, bias, torch.bfloat16, tile=tile)
     if not tiles:
         providers["hip"] = lambda: scaled_mm_hip(a, b_prepacked, scale, bias, torch.bfloat16)
 

@@ -14,6 +14,8 @@
 #pragma clang diagnostic pop
 #endif
 
+#include "feather_tiles.h"
+
 #include <cstdint>
 #include <optional>
 
@@ -141,7 +143,6 @@ template <int kBlockWarpsM,
           int kUnrollK,
           int kRepeatM,
           int kRepeatN,
-          bool kEnableAWsgr,
           bool kUseFp8E5M2,
           bool kABf16In,
           bool kOutputBf16,
@@ -213,11 +214,9 @@ __global__ void scaled_mm_kernel(
         }
     }
 
-    // Loading A: K0xMxK1 layout with physical/inverse row mapping and
-    // wave-separated global-read ownership.
+    // Loading A: K0xMxK1 layout with physical/inverse row mapping.
     constexpr int kAVecs = kK0 * kBlockM;
-    constexpr int kAOwnerWaves = kEnableAWsgr ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
-    constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
+    constexpr int kAOwnerThreads = kBlockWarpsM * kBlockWarpsN * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
     const auto a_row_phys_to_logi = [&](const int row_phys) -> int {
         const int tile_base = row_phys & ~15;
@@ -233,17 +232,10 @@ __global__ void scaled_mm_kernel(
     // skipping the load, and the tail stages are zeroed through B afterwards (a zero B row makes the
     // product zero regardless of the A that was clamped into place).
     const auto load_a_lds_k0mk1 = [&](const int stage, const int64_t kk) -> void {
-        // WSGR ownership: only A-owner waves issue A global->LDS stores.
-        if constexpr (kEnableAWsgr) {
-            if (wave_id >= kAOwnerWaves) return;
-        }
-
-        const int a_owner_tid = kEnableAWsgr ? (wave_id * kWaveSize + lane) : tid;
-
         // Physical LDS space is traversed directly. Global logical row is obtained by inverse map.
         #pragma unroll
         for (int v = 0; v < kAVecsPerOwnerThread; ++v) {
-            const int vec_idx = a_owner_tid + v * kAOwnerThreads;
+            const int vec_idx = tid + v * kAOwnerThreads;
             if (vec_idx >= kAVecs) continue;
 
             // Decode vec_idx to [k0][m_phys].
@@ -464,61 +456,6 @@ struct ConfigTag {
     static constexpr int kRepeatN = RN;
 };
 
-// Mixed-precision A WSGR is only robust in a few regions on the current ROCm nightly: small-K u=4
-// repeat_m=1 kernels, tall u=2 repeat_m=2 kernels, and square u=2 repeat_m=4 kernels.
-template <typename Config>
-constexpr bool should_enable_a_wsgr(const int64_t K)
-{
-    if constexpr (Config::kBlockWarpsN == 1) {
-        return false;
-    }
-
-    if constexpr (Config::kRepeatM == 1) {
-        return Config::kUnrollK == 4 && K <= 1024;
-    }
-
-    if constexpr (Config::kRepeatM >= 8) {
-        return false;
-    }
-
-    if constexpr (Config::kRepeatM == 2) {
-        return Config::kBlockWarpsM > Config::kBlockWarpsN && Config::kUnrollK == 2;
-    }
-
-    if constexpr (Config::kRepeatM == 4) {
-        return Config::kBlockWarpsM == Config::kBlockWarpsN && Config::kUnrollK == 2;
-    }
-
-    return false;
-}
-
-// Whether any K can enable WSGR for this config, i.e. whether the WSGR body is worth instantiating.
-template <typename Config>
-constexpr bool a_wsgr_instance_needed()
-{
-    if constexpr (Config::kBlockWarpsN == 1) {
-        return false;
-    }
-
-    if constexpr (Config::kRepeatM == 1) {
-        return Config::kUnrollK == 4;
-    }
-
-    if constexpr (Config::kRepeatM >= 8) {
-        return false;
-    }
-
-    if constexpr (Config::kRepeatM == 2) {
-        return Config::kBlockWarpsM > Config::kBlockWarpsN && Config::kUnrollK == 2;
-    }
-
-    if constexpr (Config::kRepeatM == 4) {
-        return Config::kBlockWarpsM == Config::kBlockWarpsN && Config::kUnrollK == 2;
-    }
-
-    return false;
-}
-
 struct LaunchArgs {
     const uint16_t* a;
     const uint8_t* b_prepacked;
@@ -536,7 +473,7 @@ struct LaunchArgs {
     hipStream_t stream;
 };
 
-template <typename Config, bool kEnableAWsgr, bool kUseFp8E5M2, bool kABf16In, bool kOutputBf16, bool kTailFree>
+template <typename Config, bool kUseFp8E5M2, bool kABf16In, bool kOutputBf16, bool kTailFree>
 void launch_kernel(const LaunchArgs& args) {
     constexpr int kBlockM = kWmmaM * Config::kBlockWarpsM * Config::kRepeatM;
     constexpr int kBlockN = kWmmaN * Config::kBlockWarpsN * Config::kRepeatN;
@@ -546,7 +483,7 @@ void launch_kernel(const LaunchArgs& args) {
                     static_cast<uint32_t>((args.M + kBlockM - 1) / kBlockM), 1);
     hipLaunchKernelGGL(
         (scaled_mm_kernel<Config::kBlockWarpsM, Config::kBlockWarpsN, Config::kUnrollK, Config::kRepeatM, Config::kRepeatN,
-                          kEnableAWsgr, kUseFp8E5M2, kABf16In, kOutputBf16, kTailFree>),
+                          kUseFp8E5M2, kABf16In, kOutputBf16, kTailFree>),
         grid, block, 0, args.stream,
         args.a, args.b_prepacked, args.scale, args.bias, args.c,
         args.M, args.N, args.K, args.has_scale, args.has_bias);
@@ -555,16 +492,16 @@ void launch_kernel(const LaunchArgs& args) {
 // bf16 activations are widened to fp16 while staging, so one body serves both: the fp16 decode is the
 // cheaper one and the widening is the conversion a tensor cast would do anyway. The native bf16 MMA
 // was measured against this and lost on the wide cells.
-template <typename Config, bool kEnableAWsgr, bool kUseFp8E5M2, bool kABf16In, bool kOutputBf16>
+template <typename Config, bool kUseFp8E5M2, bool kABf16In, bool kOutputBf16>
 void launch_dtype(const LaunchArgs& args, const bool tail_free) {
     if (tail_free) {
-        launch_kernel<Config, kEnableAWsgr, kUseFp8E5M2, kABf16In, kOutputBf16, true>(args);
+        launch_kernel<Config, kUseFp8E5M2, kABf16In, kOutputBf16, true>(args);
     } else {
-        launch_kernel<Config, kEnableAWsgr, kUseFp8E5M2, kABf16In, kOutputBf16, false>(args);
+        launch_kernel<Config, kUseFp8E5M2, kABf16In, kOutputBf16, false>(args);
     }
 }
 
-template <typename Config, bool kEnableAWsgr, bool kUseFp8E5M2>
+template <typename Config, bool kUseFp8E5M2>
 void launch_for_a_dtype(const LaunchArgs& args) {
     constexpr int kBlockM = kWmmaM * Config::kBlockWarpsM * Config::kRepeatM;
     constexpr int kBlockN = kWmmaN * Config::kBlockWarpsN * Config::kRepeatN;
@@ -572,72 +509,25 @@ void launch_for_a_dtype(const LaunchArgs& args) {
     const bool tail_free = args.M % kBlockM == 0 && args.N % kBlockN == 0 && args.K % kChunkK == 0;
     if (args.a_bf16) {
         if (args.output_bf16) {
-            launch_dtype<Config, kEnableAWsgr, kUseFp8E5M2, true, true>(args, tail_free);
+            launch_dtype<Config, kUseFp8E5M2, true, true>(args, tail_free);
         } else {
-            launch_dtype<Config, kEnableAWsgr, kUseFp8E5M2, true, false>(args, tail_free);
+            launch_dtype<Config, kUseFp8E5M2, true, false>(args, tail_free);
         }
     } else if (args.output_bf16) {
-        launch_dtype<Config, kEnableAWsgr, kUseFp8E5M2, false, true>(args, tail_free);
+        launch_dtype<Config, kUseFp8E5M2, false, true>(args, tail_free);
     } else {
-        launch_dtype<Config, kEnableAWsgr, kUseFp8E5M2, false, false>(args, tail_free);
+        launch_dtype<Config, kUseFp8E5M2, false, false>(args, tail_free);
     }
 }
 
 template <typename Config>
 void launch_scaled_mm_configured(const LaunchArgs& args) {
     if (args.use_fp8_e5m2) {
-        if constexpr (a_wsgr_instance_needed<Config>()) {
-            if (should_enable_a_wsgr<Config>(args.K)) {
-                launch_for_a_dtype<Config, true, true>(args);
-                return;
-            }
-        }
-        launch_for_a_dtype<Config, false, true>(args);
+        launch_for_a_dtype<Config, true>(args);
     } else {
-        if constexpr (a_wsgr_instance_needed<Config>()) {
-            if (should_enable_a_wsgr<Config>(args.K)) {
-                launch_for_a_dtype<Config, true, false>(args);
-                return;
-            }
-        }
-        launch_for_a_dtype<Config, false, false>(args);
+        launch_for_a_dtype<Config, false>(args);
     }
 }
-
-// One row per instantiated tile: (warps_m, warps_n, unroll_k, repeat_m, repeat_n). This is the search
-// space the heuristic in feather_ops/scaled_mm.py selects from.
-#define FEATHER_SCALED_MM_TILES(X) \
-    X(1, 1, 2, 1, 2)               \
-    X(1, 1, 4, 1, 2)               \
-    X(1, 2, 2, 1, 2)               \
-    X(1, 2, 4, 1, 2)               \
-    X(1, 4, 2, 1, 2)               \
-    X(1, 4, 4, 1, 2)               \
-    X(1, 8, 2, 1, 2)               \
-    X(1, 8, 4, 1, 2)               \
-    X(1, 1, 2, 2, 2)               \
-    X(1, 1, 4, 2, 2)               \
-    X(1, 1, 2, 4, 4)               \
-    X(1, 1, 4, 4, 4)               \
-    X(1, 2, 2, 2, 2)               \
-    X(1, 2, 4, 2, 2)               \
-    X(2, 1, 2, 2, 2)               \
-    X(2, 2, 2, 2, 2)               \
-    X(2, 1, 4, 2, 2)               \
-    X(1, 4, 2, 4, 2)               \
-    X(1, 4, 4, 4, 2)               \
-    X(1, 8, 2, 8, 2)               \
-    X(1, 8, 4, 8, 2)               \
-    X(2, 2, 2, 4, 4)               \
-    X(2, 2, 4, 4, 4)               \
-    X(2, 4, 2, 4, 2)               \
-    X(2, 4, 4, 4, 2)               \
-    X(2, 4, 2, 4, 4)               \
-    X(2, 4, 4, 4, 4)               \
-    X(4, 2, 2, 2, 4)               \
-    X(4, 2, 4, 2, 4)               \
-    X(4, 4, 2, 4, 2)               \
-    X(4, 4, 2, 4, 4)
 
 struct TileQuery {
     int block_warps_m;
