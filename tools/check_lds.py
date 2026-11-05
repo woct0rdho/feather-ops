@@ -3,8 +3,9 @@
 
 The kernel's shared storage is a union whose size is a compile-time function of the tile, but the number the
 runtime allocates comes from the code object's `group_segment_fixed_size` metadata, and the two can disagree:
-`(2,2,2,2,2)` with `prefetch` and fp16 activations is allocated 55296 B against a 6144 B union. That costs
-6x the occupancy, so a mismatch is always a bug, either in the source or in the compiler.
+`(2,2,2,2,2)` with `prefetch` and fp16 activations was allocated 55296 B against a 6144 B union (that is
+what found the `-disable-promote-alloca-to-lds` flag in `tools/hip_flags.py`). A mismatch costs occupancy, so
+it is always a bug, either in the source or in the compiler.
 
 Usage: `python tools/check_lds.py` (needs hipcc and ~40 s), or `python tools/check_lds.py --kernel path.cu`.
 It is not part of the test suite because it compiles the kernel.
@@ -16,6 +17,9 @@ import re
 import shutil
 import subprocess
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from hip_flags import DEVICE_FLAGS
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WMMA_K = 16
@@ -37,7 +41,20 @@ def expected_bytes(tile: tuple[int, ...]) -> int:
 
 def compile_isa(kernel: pathlib.Path) -> str:
     hipcc = shutil.which("hipcc") or str(pathlib.Path(sys.executable).parent / "hipcc")
-    command = [hipcc, "-O3", "--offload-arch=gfx1151", "-DNO_PYTORCH", "-I", str(kernel.parent), "--cuda-device-only", "-S", "-o", "-", str(kernel)]
+    command = [
+        hipcc,
+        "-O3",
+        "--offload-arch=gfx1151",
+        "-DNO_PYTORCH",
+        "-I",
+        str(kernel.parent),
+        *DEVICE_FLAGS,
+        "--cuda-device-only",
+        "-S",
+        "-o",
+        "-",
+        str(kernel),
+    ]
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise SystemExit(f"hipcc failed:\n{result.stderr[-4000:]}")

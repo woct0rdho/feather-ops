@@ -22,10 +22,10 @@ from .tiles import gemm_block_sizes
 _TILE_16x256 = (1, 8, 4, 1, 2, 0)
 _TILE_16x64 = (1, 2, 4, 1, 2, 1)
 _TILE_64x64 = (2, 2, 2, 2, 2, 1)
-# The same box without the overlapped refill. The compiler allocates 55296 B of LDS metadata for the fp16
-# activation variants of the `prefetch` row (against the 6144 B its code addresses, and against 6144 B for
-# the bf16 variants), which costs 6x the occupancy and measures 29-41% slower there, while the bf16 variant
-# is 17-52% faster than this one. So fp16 activations take this row and bf16 takes the row above.
+# The same box without the overlapped refill. It is the fp16-activation choice: with fp16 A the prefetch row
+# measures 12-67% slower on the cells this tile serves (`M <= 256`), while with bf16 A it is 17-52% faster.
+# The prefetch staging splits the A fetch from its LDS store, and for a plain fp16 copy the compiler schedules
+# that pair worse than the fused load-store the non-prefetch row keeps.
 _TILE_64x64_PLAIN = (2, 2, 2, 2, 2, 0)
 _TILE_64x128 = (1, 4, 2, 4, 2, 1)
 _TILE_128x128 = (2, 2, 2, 4, 4, 0)

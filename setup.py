@@ -11,6 +11,7 @@ from torch.utils import cpp_extension
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 import tools.gen_tiles as _gen_tiles
+from tools.hip_flags import DEVICE_FLAGS
 
 CSRC = ROOT / "csrc"
 SOURCES = [
@@ -103,6 +104,7 @@ if os.name == "nt":
 
 hip_flags = [
     *common_flags,
+    *DEVICE_FLAGS,
     "-U__HIP_NO_HALF_CONVERSIONS__",
     "-U__HIP_NO_HALF_OPERATORS__",
     "-U__HIP_NO_HALF2_OPERATORS__",
