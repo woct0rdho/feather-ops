@@ -128,7 +128,14 @@ def measure(
     max_iters: int = 32,
     cold: bool = False,
 ) -> dict[str, Measurement]:
-    """Time several providers on one case, interleaved, alternating order per round."""
+    """Time several providers on one case, interleaved, with the order rotated per round.
+
+    Rotating rather than reversing is what makes the pairing honest: with `n` providers and `r` rounds, a
+    provider sits at each position `floor(r / n)` times (more, up to one extra, when `r % n`), whereas a
+    reversal leaves the middle position owned by the same provider in every round. That bias is not
+    hypothetical - two providers that launch the same kernel measured 1.6% apart when one of them always
+    sat in the middle of a three-provider run.
+    """
     names = list(providers)
     per_round: dict[str, list[float]] = {name: [] for name in names}
 
@@ -152,7 +159,8 @@ def measure(
             estimates[name] = max(_timed_batch(providers[name], 1), 1e-6)
         iters = {name: min(max(round(target_ms / ms), 1), max_iters) for name, ms in estimates.items()}
         for index in range(rounds):
-            order = names if index % 2 == 0 else list(reversed(names))
+            shift = index % len(names)
+            order = names[shift:] + names[:shift]
             for name in order:
                 per_round[name].append(_timed_batch(providers[name], iters[name]))
 

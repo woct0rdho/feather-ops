@@ -6,8 +6,10 @@ heuristics can return is always an instantiated kernel. Adding a tile is one lin
 It must not import torch, because `setup.py` reads it before the extension exists.
 
 Tile formats, all `(block_warps_m, block_warps_n, ...)`, i.e. `block_m = 16 * warps_m * repeat_m`:
-- `SCALED_MM_TILES` and `INT8_TILES`: `(warps_m, warps_n, unroll_k, repeat_m, repeat_n)`, with
-  `chunk_k = 16 * unroll_k`.
+- `SCALED_MM_TILES`: `(warps_m, warps_n, unroll_k, repeat_m, repeat_n, pipeline)`, with `chunk_k = 16 * unroll_k`.
+  `pipeline` is how the next chunk's refill is overlapped with the current one's WMMAs: 0 computes it after
+  a barrier, 1 keeps two LDS buffers, 2 prefetches into registers and reuses one buffer.
+- `INT8_TILES`: `(warps_m, warps_n, unroll_k, repeat_m, repeat_n)`. The int8 kernel always double-buffers.
 - `CONV_TILES`: `(warps_m, warps_n, repeat_m, repeat_n, rows)`, where `rows` is how many output rows one
   block computes. The conv kernel has no `unroll_k`: its k loop is the nine taps.
 """
@@ -79,43 +81,47 @@ INT8_TILES = [
 ]
 
 SCALED_MM_TILES = [
-    (1, 1, 2, 1, 2),
-    (1, 1, 4, 1, 2),
-    (1, 2, 2, 1, 2),
-    (1, 2, 4, 1, 2),
-    (1, 4, 2, 1, 2),
-    (1, 4, 4, 1, 2),
-    (1, 8, 2, 1, 2),
-    (1, 8, 4, 1, 2),
-    (1, 1, 2, 2, 2),
-    (1, 1, 4, 2, 2),
-    (1, 1, 2, 4, 4),
-    (1, 1, 4, 4, 4),
-    (1, 2, 2, 2, 2),
-    (1, 2, 4, 2, 2),
-    (2, 1, 2, 2, 2),
-    (2, 2, 2, 2, 2),
-    (2, 1, 4, 2, 2),
-    (1, 4, 2, 4, 2),
-    (1, 4, 4, 4, 2),
-    (1, 8, 2, 8, 2),
-    (1, 8, 4, 8, 2),
-    (2, 2, 2, 4, 4),
-    (2, 2, 4, 4, 4),
-    (2, 4, 2, 4, 2),
-    (2, 4, 4, 4, 2),
-    (2, 4, 2, 4, 4),
-    (2, 4, 4, 4, 4),
-    (4, 2, 2, 2, 4),
-    (4, 2, 4, 2, 4),
-    (4, 4, 2, 4, 2),
-    (4, 4, 2, 4, 4),
+    (1, 1, 2, 1, 2, 0),
+    (1, 1, 4, 1, 2, 0),
+    (1, 2, 2, 1, 2, 0),
+    (1, 2, 4, 1, 2, 0),
+    (1, 2, 4, 1, 2, 1),  # refill overlapped: wins on the short tiles
+    (1, 4, 2, 1, 2, 0),
+    (1, 4, 4, 1, 2, 0),
+    (1, 8, 2, 1, 2, 0),
+    (1, 8, 4, 1, 2, 0),
+    (1, 1, 2, 2, 2, 0),
+    (1, 1, 4, 2, 2, 0),
+    (1, 1, 2, 4, 4, 0),
+    (1, 1, 4, 4, 4, 0),
+    (1, 2, 2, 2, 2, 0),
+    (1, 2, 2, 2, 2, 1),  # refill overlapped: wins on the short tiles
+    (1, 2, 4, 2, 2, 0),
+    (2, 1, 2, 2, 2, 0),
+    (2, 2, 2, 2, 2, 0),
+    (2, 2, 2, 2, 2, 1),  # refill overlapped: wins on the short tiles
+    (2, 1, 4, 2, 2, 0),
+    (1, 4, 2, 4, 2, 0),
+    (1, 4, 2, 4, 2, 1),  # refill overlapped: wins on the short tiles
+    (1, 4, 4, 4, 2, 0),
+    (1, 8, 2, 8, 2, 0),
+    (1, 8, 4, 8, 2, 0),
+    (2, 2, 2, 4, 4, 0),
+    (2, 2, 4, 4, 4, 0),
+    (2, 4, 2, 4, 2, 0),
+    (2, 4, 4, 4, 2, 0),
+    (2, 4, 2, 4, 4, 0),
+    (2, 4, 4, 4, 4, 0),
+    (4, 2, 2, 2, 4, 0),
+    (4, 2, 4, 2, 4, 0),
+    (4, 4, 2, 4, 2, 0),
+    (4, 4, 2, 4, 4, 0),
 ]
 
 
 def gemm_block_sizes(tile: tuple[int, ...]) -> tuple[int, int, int]:
     """`(block_m, block_n, chunk_k)` of a `SCALED_MM_TILES` / `INT8_TILES` entry."""
-    warps_m, warps_n, unroll_k, repeat_m, repeat_n = tile
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n = tile[:5]
     return 16 * warps_m * repeat_m, 16 * warps_n * repeat_n, 16 * unroll_k
 
 

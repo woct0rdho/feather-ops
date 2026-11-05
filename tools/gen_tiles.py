@@ -46,7 +46,7 @@ def render() -> str:
         lines[-1] = lines[-1].removesuffix(" \\")
         lines.append("")
 
-    macro("FEATHER_SCALED_MM_TILES", tiles.SCALED_MM_TILES, "fp16-fp8: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)")
+    macro("FEATHER_SCALED_MM_TILES", tiles.SCALED_MM_TILES, "fp16-fp8: (warps_m, warps_n, unroll_k, repeat_m, repeat_n, pipeline)")
     macro("FEATHER_INT8_TILES", tiles.INT8_TILES, "int8 ConvRot: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)")
     macro("FEATHER_CONV_TILES", tiles.CONV_TILES, "conv2d 3x3: (warps_m, warps_n, repeat_m, repeat_n, rows)")
     return "\n".join(lines)

@@ -45,14 +45,14 @@ def real_cells():
     return [(family, m, n, k) for family, (shapes, ms) in FAMILIES.items() for n, k in shapes for m in ms]
 
 
-def parse_tiles(text: str) -> list[tuple[int, int, int, int, int]]:
+def parse_tiles(text: str) -> list[tuple[int, int, int, int, int, int]]:
     if text == "":
         return list(SCALED_MM_TILES)
-    tiles: list[tuple[int, int, int, int, int]] = []
+    tiles: list[tuple[int, int, int, int, int, int]] = []
     for chunk in text.split(";"):
         values = [int(v) for v in chunk.split(",")]
-        assert len(values) == 5, f"a tile is five ints, got {chunk!r}"
-        tile = (values[0], values[1], values[2], values[3], values[4])
+        assert len(values) == 6, f"a tile is six ints (warps_m, warps_n, unroll_k, repeat_m, repeat_n, prefetch), got {chunk!r}"
+        tile = (values[0], values[1], values[2], values[3], values[4], values[5])
         assert tile in SCALED_MM_TILES, f"not instantiated: {tile}"
         tiles.append(tile)
     return tiles
@@ -80,7 +80,7 @@ def build_case(family: str, M: int, N: int, K: int, tiles) -> Case:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cells", default=None, help="M,N,K;M,N,K override")
-    parser.add_argument("--tiles", nargs="?", const="", default=None, help="add explicit tiles: 'a,b,c,d,e;...' or nothing for all")
+    parser.add_argument("--tiles", nargs="?", const="", default=None, help="add explicit tiles: 'm,n,u,rm,rn,prefetch;...' or nothing for all")
     parser.add_argument("--square", action="store_true", help="run the N^3 sweep instead of the real cells")
     add_protocol_args(parser)
     args = parser.parse_args()

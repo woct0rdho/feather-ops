@@ -138,6 +138,13 @@ __device__ __forceinline__ constexpr int a_row_phys_to_logi_16(const int x) {
 //   zero-padded to a multiple of 128 so the last chunk always reads zeros instead of running off the
 //   end. A is clamped into range for those steps, and a clamped A times a zero B row is still zero,
 //   so no staging path needs a branch.
+//
+// `kPrefetch` overlaps the refill with the WMMAs: the next chunk is fetched into registers before this
+// chunk is multiplied and stored into the same LDS buffer afterwards. That hides the global load latency
+// without a second buffer, so it costs no LDS and no occupancy - but it keeps both barriers per chunk.
+// It pays on the short tiles, where the refill is a large fraction of the chunk, and loses on the tall ones,
+// so it is a per-tile choice like `unroll_k`. A second LDS buffer (one barrier per chunk) was measured
+// against this and lost: it halves the workgroups resident on the 64 KB-per-WGPU budget for no more overlap.
 template <int kBlockWarpsM,
           int kBlockWarpsN,
           int kUnrollK,
@@ -146,7 +153,8 @@ template <int kBlockWarpsM,
           bool kUseFp8E5M2,
           bool kABf16In,
           bool kOutputBf16,
-          bool kTailFree>
+          bool kTailFree,
+          bool kPrefetch>
 __global__ void scaled_mm_kernel(
     const uint16_t* __restrict__ const a,
     const uint8_t* __restrict__ const b_prepacked,
@@ -172,6 +180,7 @@ __global__ void scaled_mm_kernel(
     constexpr int kK0 = kWmmaK / kK1;
     constexpr int kAStrideK1 = kK1;
     constexpr int kShASize = kUnrollK * kK0 * kBlockM * kAStrideK1;
+    constexpr int kShBSize = kUnrollK * kBlockN * kWmmaK;
 
     // B uses NxK prepacked layout for efficient vec16 stores during loading
     // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*16 output elements.
@@ -180,7 +189,7 @@ __global__ void scaled_mm_kernel(
     union SharedStorage {
         struct {
             uint16_t a[kShASize];
-            uint8_t b[kUnrollK][kBlockN][kWmmaK];
+            uint8_t b[kShBSize];
         } ab;
         uint16_t c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
     };
@@ -226,6 +235,9 @@ __global__ void scaled_mm_kernel(
     const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> uint16_t* {
         const int idx = ((stage * kK0 + k0) * kBlockM + m) * kAStrideK1;
         return &sh.ab.a[idx];
+    };
+    const auto sh_b_row_ptr = [&](const int stage, const int n) -> uint8_t* {
+        return &sh.ab.b[(stage * kBlockN + n) * kWmmaK];
     };
 
     // Staging is branch-free: an out-of-range k is clamped to the last valid 8-element slot instead of
@@ -278,7 +290,7 @@ __global__ void scaled_mm_kernel(
                                             : min(static_cast<int64_t>(block_n + n_phys), N - 1);
             const uint8_t* __restrict__ const b_src = b_prepacked + kk * N + b_col * kWmmaK;
 
-            uint8_t* __restrict__ const sh_b_dst = &sh.ab.b[stage][n_phys][0];
+            uint8_t* __restrict__ const sh_b_dst = sh_b_row_ptr(stage, n_phys);
             *reinterpret_cast<uint4*>(sh_b_dst) = *reinterpret_cast<const uint4*>(b_src);
         }
     };
@@ -305,7 +317,7 @@ __global__ void scaled_mm_kernel(
             const int tile_n = warp_n + rn * kBlockWarpsN;
             const int n_col = tile_n * kWmmaN + lane_in_subgroup;
 
-            const uint4 p = *reinterpret_cast<const uint4*>(&sh.ab.b[stage][n_col][0]);
+            const uint4 p = *reinterpret_cast<const uint4*>(sh_b_row_ptr(stage, n_col));
             const uint32_t p32[4] = {p.x, p.y, p.z, p.w};
             uint32_t h32[8];
             #pragma unroll
@@ -359,23 +371,137 @@ __global__ void scaled_mm_kernel(
         }
     };
 
-    // Prologue: load first chunk into LDS
-    load_chunk(0);
-    __syncthreads();
+    if constexpr (kPrefetch) {
+        // Ownership of the chunk's 16-byte vectors is flat, so a thread's (row, k) slots are pure functions of
+        // `tid` and the unrolled index: no per-vector array is materialized, which keeps the payload in VGPRs.
+        constexpr int kAVecsFlat = kUnrollK * kAVecs;
+        constexpr int kAVecsPerThread = (kAVecsFlat + kAOwnerThreads - 1) / kAOwnerThreads;
+        constexpr int kBVecsFlat = kUnrollK * kBVecs;
+        constexpr int kBVecsPerThread = (kBVecsFlat + kThreads - 1) / kThreads;
+        static_assert(kAVecsPerThread > 0 && kBVecsPerThread > 0, "a chunk is smaller than one vector per thread");
 
-    // Main loop
-    for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
-        #pragma unroll
-        for (int u = 0; u < kUnrollK; ++u) {
-            wmma_compute_stage(u);
-        }
+        struct Stage {
+            uint4 a[kAVecsPerThread];
+            uint4 b[kBVecsPerThread];
+        } stage;
+
+        const auto a_vec = [&](const int v) { return tid + v * kAOwnerThreads; };
+        const auto a_owns = [&](const int v) { return a_vec(v) < kAVecsFlat; };
+        const auto a_stage = [&](const int v) { return min(a_vec(v) / kAVecs, kUnrollK - 1); };
+        const auto a_k0 = [&](const int v) { return min(a_vec(v) / kBlockM % kK0, kK0 - 1); };
+        const auto a_m = [&](const int v) { return a_vec(v) % kBlockM; };
+        const auto a_row = [&](const int v) -> int64_t {
+            const int m_logi = a_row_phys_to_logi(a_m(v));
+            return kTailFree ? (block_m + m_logi) : ((m_logi < m_rows) ? (block_m + m_logi) : m_clamp_row);
+        };
+        const auto a_lds = [&](const int v) { return sh_a_row_ptr(a_stage(v), a_k0(v), a_m(v)); };
+
+        const auto b_vec = [&](const int v) { return tid + v * kThreads; };
+        const auto b_owns = [&](const int v) { return b_vec(v) < kBVecsFlat; };
+        const auto b_stage = [&](const int v) { return min(b_vec(v) / kBVecs, kUnrollK - 1); };
+        const auto b_n = [&](const int v) { return b_vec(v) % kBVecs; };
+        const auto b_lds = [&](const int v) { return sh_b_row_ptr(b_stage(v), b_n(v)); };
+        const auto b_src = [&](const int v, const int64_t kk) -> const uint8_t* {
+            const int64_t col = kTailFree ? static_cast<int64_t>(block_n + b_n(v))
+                                          : min(static_cast<int64_t>(block_n + b_n(v)), N - 1);
+            return b_prepacked + (static_cast<int64_t>(b_stage(v)) * N + col) * kWmmaK + (kk / kWmmaK) * N * kWmmaK;
+        };
+
+        const auto fetch_a = [&](const int64_t kk, const bool clamp_k) {
+            #pragma unroll
+            for (int v = 0; v < kAVecsPerThread; ++v) {
+                if (!a_owns(v)) continue;
+                const int64_t k = static_cast<int64_t>(a_stage(v) * kWmmaK + a_k0(v) * kK1) + kk;
+                const uint16_t* __restrict__ const src = a + a_row(v) * K + (clamp_k ? min(k, K - kK1) : k);
+                const uint4 raw = *reinterpret_cast<const uint4*>(src);
+                if constexpr (kABf16In) {
+                    stage.a[v].x = bf16x2_to_half2(raw.x);
+                    stage.a[v].y = bf16x2_to_half2(raw.y);
+                    stage.a[v].z = bf16x2_to_half2(raw.z);
+                    stage.a[v].w = bf16x2_to_half2(raw.w);
+                } else {
+                    stage.a[v] = raw;
+                }
+            }
+        };
+
+        const auto fetch_b = [&](const int64_t kk) {
+            #pragma unroll
+            for (int v = 0; v < kBVecsPerThread; ++v) {
+                if (!b_owns(v)) continue;
+                stage.b[v] = *reinterpret_cast<const uint4*>(b_src(v, kk));
+            }
+        };
+
+        const auto store_chunk = [&]() {
+            #pragma unroll
+            for (int v = 0; v < kAVecsPerThread; ++v) {
+                if (!a_owns(v)) continue;
+                *reinterpret_cast<uint4*>(a_lds(v)) = stage.a[v];
+            }
+            #pragma unroll
+            for (int v = 0; v < kBVecsPerThread; ++v) {
+                if (!b_owns(v)) continue;
+                *reinterpret_cast<uint4*>(b_lds(v)) = stage.b[v];
+            }
+        };
+
+        const auto fetch_chunk = [&](const int iter_idx) {
+            const int64_t next_k = static_cast<int64_t>(iter_idx + 1) * kChunkK;
+            if constexpr (kTailFree) {
+                fetch_a(next_k, false);
+            } else if (iter_idx + 2 == total_chunks) {
+                fetch_a(next_k, true);
+            } else {
+                fetch_a(next_k, false);
+            }
+            fetch_b(next_k);
+        };
+
+        // Prologue: the first chunk goes straight to LDS. Every later chunk is fetched into registers while
+        // the current one is multiplied, then stored after the barrier that publishes the reads, so the store
+        // never races a fragment load and the global latency is off the critical path.
+        fetch_a(0, false);
+        fetch_b(0);
+        store_chunk();
         __syncthreads();
 
-        if (iter_idx + 1 < total_chunks) {
-            asm volatile("s_setprio 1" ::: "memory");
-            load_chunk(iter_idx + 1);
-            asm volatile("s_setprio 0" ::: "memory");
+        for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
+            const bool more = iter_idx + 1 < total_chunks;
+            if (more) {
+                asm volatile("s_setprio 1" ::: "memory");
+                fetch_chunk(iter_idx);
+                asm volatile("s_setprio 0" ::: "memory");
+            }
+            #pragma unroll
+            for (int u = 0; u < kUnrollK; ++u) {
+                wmma_compute_stage(u);
+            }
             __syncthreads();
+            if (more) {
+                store_chunk();
+                __syncthreads();
+            }
+        }
+    } else {
+        // Prologue: load first chunk into LDS
+        load_chunk(0);
+        __syncthreads();
+
+        // Main loop
+        for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
+            #pragma unroll
+            for (int u = 0; u < kUnrollK; ++u) {
+                wmma_compute_stage(u);
+            }
+            __syncthreads();
+
+            if (iter_idx + 1 < total_chunks) {
+                asm volatile("s_setprio 1" ::: "memory");
+                load_chunk(iter_idx + 1);
+                asm volatile("s_setprio 0" ::: "memory");
+                __syncthreads();
+            }
         }
     }
 
@@ -447,13 +573,14 @@ __global__ void scaled_mm_kernel(
 
 } // namespace
 
-template <int M, int N, int U, int RM, int RN>
+template <int M, int N, int U, int RM, int RN, bool P>
 struct ConfigTag {
     static constexpr int kBlockWarpsM = M;
     static constexpr int kBlockWarpsN = N;
     static constexpr int kUnrollK = U;
     static constexpr int kRepeatM = RM;
     static constexpr int kRepeatN = RN;
+    static constexpr bool kPrefetch = P;
 };
 
 struct LaunchArgs {
@@ -483,7 +610,7 @@ void launch_kernel(const LaunchArgs& args) {
                     static_cast<uint32_t>((args.M + kBlockM - 1) / kBlockM), 1);
     hipLaunchKernelGGL(
         (scaled_mm_kernel<Config::kBlockWarpsM, Config::kBlockWarpsN, Config::kUnrollK, Config::kRepeatM, Config::kRepeatN,
-                          kUseFp8E5M2, kABf16In, kOutputBf16, kTailFree>),
+                          kUseFp8E5M2, kABf16In, kOutputBf16, kTailFree, Config::kPrefetch>),
         grid, block, 0, args.stream,
         args.a, args.b_prepacked, args.scale, args.bias, args.c,
         args.M, args.N, args.K, args.has_scale, args.has_bias);
@@ -535,6 +662,7 @@ struct TileQuery {
     int unroll_k;
     int repeat_m;
     int repeat_n;
+    bool prefetch;
 };
 
 bool dispatch_scaled_mm(const LaunchArgs& args, const TileQuery& tile)
@@ -543,14 +671,14 @@ bool dispatch_scaled_mm(const LaunchArgs& args, const TileQuery& tile)
         using Config = decltype(tag);
         if (tile.block_warps_m != Config::kBlockWarpsM || tile.block_warps_n != Config::kBlockWarpsN ||
             tile.unroll_k != Config::kUnrollK || tile.repeat_m != Config::kRepeatM ||
-            tile.repeat_n != Config::kRepeatN) {
+            tile.repeat_n != Config::kRepeatN || tile.prefetch != Config::kPrefetch) {
             return false;
         }
         launch_scaled_mm_configured<Config>(args);
         return true;
     };
 
-#define FEATHER_TRY_TILE(m, n, u, rm, rn) || try_launch(ConfigTag<m, n, u, rm, rn>{})
+#define FEATHER_TRY_TILE(m, n, u, rm, rn, prefetch) || try_launch(ConfigTag<m, n, u, rm, rn, prefetch != 0>{})
     return false FEATHER_SCALED_MM_TILES(FEATHER_TRY_TILE);
 #undef FEATHER_TRY_TILE
 }
@@ -575,11 +703,12 @@ extern "C" bool launch_scaled_mm(
     const int unroll_k,
     const int repeat_m,
     const int repeat_n,
+    const bool prefetch,
     hipStream_t stream)
 {
     const LaunchArgs args{a, b_prepacked, scale, bias, c, M, N, K, has_scale, has_bias,
                           use_fp8_e5m2, a_bf16, output_bf16, stream};
-    const TileQuery tile{block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n};
+    const TileQuery tile{block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, prefetch};
     return dispatch_scaled_mm(args, tile);
 }
 
@@ -594,7 +723,8 @@ void scaled_mm(
     const int64_t block_warps_n,
     const int64_t unroll_k,
     const int64_t repeat_m,
-    const int64_t repeat_n)
+    const int64_t repeat_n,
+    const bool prefetch)
 {
     STD_TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
     STD_TORCH_CHECK(b_prepacked.is_cuda(), "b_prepacked must be a CUDA tensor");
@@ -671,7 +801,7 @@ void scaled_mm(
     STD_TORCH_CHECK(threads_per_block <= 1024, "Block size exceeds HIP thread-per-block limit");
 
     const TileQuery tile{static_cast<int>(block_warps_m), static_cast<int>(block_warps_n), static_cast<int>(unroll_k),
-                         static_cast<int>(repeat_m), static_cast<int>(repeat_n)};
+                         static_cast<int>(repeat_m), static_cast<int>(repeat_n), prefetch};
     LaunchArgs args{
         reinterpret_cast<const uint16_t*>(a.const_data_ptr()),
         reinterpret_cast<const uint8_t*>(b_prepacked.const_data_ptr()),
@@ -705,7 +835,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(feather_ops, m)
         "int block_warps_n, "
         "int unroll_k, "
         "int repeat_m, "
-        "int repeat_n"
+        "int repeat_n, "
+        "bool prefetch"
         ") -> ()");
 }
 

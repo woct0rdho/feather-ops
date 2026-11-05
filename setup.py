@@ -21,7 +21,9 @@ SOURCES = [
     "csrc/hip_kernel_int8.cu",
     "csrc/hipblaslt_kernel_fp16.cu",
 ]
-HEADER_DEPENDENCIES = [path.relative_to(ROOT).as_posix() for pattern in ("*.h", "*.cuh") for path in sorted(CSRC.rglob(pattern))]
+# Absolute paths: setuptools feeds these to ninja as prerequisites, and a relative prerequisite is not
+# matched against the compiled object's dependency list.
+HEADER_DEPENDENCIES = [str(path) for pattern in ("*.h", "*.cuh") for path in sorted(CSRC.rglob(pattern))]
 
 
 def _enable_ccache() -> None:

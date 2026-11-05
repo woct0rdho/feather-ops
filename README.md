@@ -12,7 +12,7 @@ The name 'feather' is from https://github.com/SuriyaaMM/feather . On GPUs withou
 
 `csrc/hip_kernel.cu` is the fp16-fp8 kernel. The kernel is written in HIP, with intrinsics and asm when needed, without abstraction levels like CK or Triton.
 
-The kernel computes fp16/bf16 @ fp8e5m2 -> fp16/bf16. fp8 @ fp8 seems not achieving further speedup. We choose fp8e5m2 rather than fp8e4m3 because it's extremely fast to upcast fp8e5m2 -> fp16. We use fp32 accumulator in the WMMA, and downcast to fp16/bf16 for output depending on the model's compute dtype.
+The kernel computes fp16/bf16 @ fp8e5m2 -> fp16/bf16. We choose fp8e5m2 rather than fp8e4m3 because it's extremely fast to upcast fp8e5m2 -> fp16. We use fp32 accumulator in the WMMA, and downcast to fp16/bf16 for output depending on the model's compute dtype. fp8 @ fp8 is not yet considered.
 
 We prepack the B matrix into `(K/16, N, 16)` layout to enable fast 128-bit VRAM -> LDS load, and ensure that threads with adjacent N load adjacent 128-bit elements.
 

@@ -35,15 +35,15 @@ extern "C" bool launch_scaled_mm(
     const int64_t K,
     const int has_scale,
     const int has_bias,
+    const bool use_fp8_e5m2,
+    const bool a_bf16,
+    const bool output_bf16,
     const int block_warps_m,
     const int block_warps_n,
     const int unroll_k,
     const int repeat_m,
     const int repeat_n,
-    const bool use_fp8_e5m2,
-    const bool a_bf16,
-    const bool a_cast_to_fp16,
-    const bool output_bf16,
+    const bool prefetch,
     hipStream_t stream);
 
 struct Options
@@ -206,10 +206,11 @@ int main(int argc, char** argv)
             reinterpret_cast<uint16_t*>(d_c),
             opts.m, opts.n, opts.k,
             1, 1, // has_scale=1, has_bias=1
-            opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             true, // use_fp8_e5m2
-            false, false, // a_bf16, a_cast_to_fp16
+            false, // a_bf16
             false, // output_bf16
+            opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
+            false, // prefetch
             stream
         );
         if (!launched) {
@@ -232,10 +233,11 @@ int main(int argc, char** argv)
             reinterpret_cast<uint16_t*>(d_c),
             opts.m, opts.n, opts.k,
             1, 1, // has_scale=1, has_bias=1
-            opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             true, // use_fp8_e5m2
-            false, false, // a_bf16, a_cast_to_fp16
+            false, // a_bf16
             false, // output_bf16
+            opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
+            false, // prefetch
             stream
         );
         CHECK_HIP(hipEventRecord(stop, stream));

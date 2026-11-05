@@ -17,15 +17,20 @@ from torch.library import custom_op
 from .tiles import gemm_block_sizes
 
 # Tile shapes the heuristic can return, each an alias for one row of `SCALED_MM_TILES`, named by the
-# (block_m x block_n) box it covers.
-_TILE_16x256 = (1, 8, 4, 1, 2)
-_TILE_32x32 = (1, 2, 2, 2, 2)
-_TILE_32x128 = (1, 2, 4, 1, 2)
-_TILE_64x64 = (2, 2, 2, 2, 2)
-_TILE_64x128 = (1, 4, 2, 4, 2)
-_TILE_128x128 = (2, 2, 2, 4, 4)
-_TILE_128x256 = (1, 8, 4, 8, 2)
-_TILE_128x256_TALL = (2, 4, 4, 4, 2)
+# (block_m x block_n) box it covers. The last field overlaps the refill with the WMMAs, which pays on the
+# short tiles (64x64, 64x128, 32x64, 16x64) and loses on the tall ones.
+_TILE_16x256 = (1, 8, 4, 1, 2, 0)
+_TILE_16x64 = (1, 2, 4, 1, 2, 1)
+_TILE_64x64 = (2, 2, 2, 2, 2, 1)
+# The same box without the overlapped refill. The compiler allocates 55296 B of LDS metadata for the fp16
+# activation variants of the `prefetch` row (against the 6144 B its code addresses, and against 6144 B for
+# the bf16 variants), which costs 6x the occupancy and measures 29-41% slower there, while the bf16 variant
+# is 17-52% faster than this one. So fp16 activations take this row and bf16 takes the row above.
+_TILE_64x64_PLAIN = (2, 2, 2, 2, 2, 0)
+_TILE_64x128 = (1, 4, 2, 4, 2, 1)
+_TILE_128x128 = (2, 2, 2, 4, 4, 0)
+_TILE_128x256 = (1, 8, 4, 8, 2, 0)
+_TILE_128x256_TALL = (2, 4, 4, 4, 2, 0)
 
 # Weights up to this size stay in L2 across M tiles, so the tile height stops being the throughput and
 # the pick follows the output width and the grid instead.
@@ -39,35 +44,44 @@ def select_scaled_mm_config(
     a_dtype: torch.dtype = torch.float16,
     b_dtype: torch.dtype = torch.float8_e5m2,
     out_dtype: torch.dtype = torch.bfloat16,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int]:
     """Static tile choice for one shape.
 
-    Two regimes, from the weight traffic. A tile re-reads its whole B panel once per M tile, so when the
-    weight is larger than L2 the tile height is the throughput and the rule buys a tall tile. When the
-    weight fits in L2 the passes are already amortized and the output width decides instead. The
-    boundaries are measured on the cell table in the fp8 plan, not derived, so re-fit them with
-    `python -m bench.benchmark_scaled_mm_hip` rather than reasoning about them.
+    Fitted on the 139-cell table in the fp8 plan, over the ten boxes that sweep measured. Above 512 rows
+    the short 64x128 tile with the refill overlapped is the default, because the weight traffic it re-reads
+    is what binds and a taller tile only helps once `N` is wide enough that the grid, not the traffic,
+    would starve. 1024-wide and 1281-1792-wide outputs are the exception, where a 16-row tile keeps enough
+    blocks in flight to beat every taller one. At 512 rows the tile height is already bought (four M tiles),
+    so the output width and the reduction length decide. The boundaries are measured, not derived: re-fit
+    them with `python -m bench.benchmark_scaled_mm_hip --tiles` rather than reasoning about them.
     """
-    del a_dtype, b_dtype, out_dtype
+    del b_dtype, out_dtype
+    small = _TILE_64x64 if a_dtype is not torch.float16 else _TILE_64x64_PLAIN
 
     if M <= 16:
         return _TILE_16x256
     if M <= 128:
-        return _TILE_64x64
+        return small
     if M <= 256:
-        return _TILE_64x64 if N <= 4096 else _TILE_64x128
+        return small if N <= 4096 else _TILE_64x128
     if M <= 512:
-        # 512 rows is four M tiles at 128 rows, so the tile height is already bought. The output width and
-        # the length of the reduction decide instead.
-        if N <= 1280:
-            return _TILE_32x32
         if N <= 2560:
-            return _TILE_128x256_TALL if K <= 8192 else _TILE_64x128
-        if K <= 2048:
             return _TILE_64x128
-        return _TILE_128x128 if N <= 6144 else _TILE_128x256
+        if N <= 6144:
+            if K <= 8192:
+                return _TILE_64x128
+            return _TILE_128x128 if K <= 16384 else _TILE_128x256
+        return _TILE_64x128 if N <= 12288 else _TILE_128x256
     if N <= 1024:
-        return _TILE_32x128
+        return _TILE_16x64
+    if 1280 < N <= 1792 and M <= 4608:
+        # The 1536-wide cells at up to 4608 rows: a 16-row tile is the only one that fills the machine
+        # there. Past that the grid is already large and the tall tile's weight traffic wins.
+        return _TILE_16x64
+    if N <= 1280:
+        return _TILE_64x128
+    if N <= 2560 and K <= 2048 and M <= 4096:
+        return _TILE_128x256_TALL
     if N <= 4096 or N * K <= _WEIGHT_L2_SMALL_BYTES:
         return _TILE_64x128
     return _TILE_128x256
@@ -79,7 +93,7 @@ def _launch(
     scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     out: torch.Tensor,
-    tile: tuple[int, int, int, int, int],
+    tile: tuple[int, int, int, int, int, int],
 ) -> None:
     torch.ops.feather_ops.scaled_mm.default(a, b_prepacked, scale, bias, out, *tile)
 
@@ -103,7 +117,7 @@ def scaled_mm_hip(
     scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     out_dtype: torch.dtype,
-    tile: tuple[int, int, int, int, int] | None = None,
+    tile: tuple[int, int, int, int, int, int] | None = None,
 ) -> torch.Tensor:
     """`(a @ b^T) * scale + bias` against the prepacked fp8 weight `b_prepacked`.
 
