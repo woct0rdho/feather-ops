@@ -17,6 +17,7 @@ from torch.library import custom_op
 
 # Tile schedule per role, measured on the model cells of the int8 ConvRot plan (bench/benchmark_int8_convrot.py).
 # Each is a row of `INT8_TILES`. The comment is the (block_m x block_n) box and thread count.
+_TILE_TINY_M = (1, 2, 4, 1, 2)  # 16x64, 64 threads: M <= 16 (a single row, per-token passes)
 _TILE_SMALL_M = (2, 2, 2, 2, 2)  # 64x64, 128 threads: 1-256 rows (prefix passes, short text rows)
 _TILE_NARROW = (4, 2, 2, 4, 4)  # 256x128, 256 threads: narrow outputs, where a 256-wide tile is mostly tail
 _TILE_WIDE = (4, 4, 2, 4, 4)  # 256x256, 512 threads: wide outputs, the bulk of the model flops
@@ -38,12 +39,27 @@ def select_int8_config(M: int, N: int, K: int, transposed_b: bool) -> tuple[int,
     # wide enough for the 128x128 tile's larger N panel to amortize (the crossover sits at `out ~ 4096` for
     # M = 192-256 and `out ~ 8192` for M = 128. M <= 64 keeps 64x64 up to 24576, and M >= 384 is back on the
     # 128-row tile). Above the crossover the 256x256 tile loses, so the answer there is 128x128.
+    if M <= 16:
+        # A row or two: the block count is what matters, and a 16-row tile gives 4x the blocks of 64 rows.
+        return _TILE_TINY_M
     if M <= 64:
         return _TILE_SMALL_M
     if M <= 128:
         return _TILE_SMALL_M if out <= 8192 else _TILE_MID
     if M <= 256:
+        # `192 x 12288 x 4096` is 6% faster on 64x64, but `256 x 12288 x 4096` in the gradient direction is 30%
+        # slower, so the crossover after which the 128x128 tile's N panel wins stays.
         return _TILE_SMALL_M if out <= 4096 else _TILE_MID
+    if M <= 512:
+        # 512 rows is four 128-row tiles, so the tile height is bought and the output width decides: the narrow
+        # tile while the output is narrow (`512 x 2048 x 1024` is 33% faster on 64x64, `512 x 4096 x 4096` 4%),
+        # the 128x128 tile once the output is 8192 wide or more, and the 256x256 tile when the reduction is long
+        # or the output is enormous, where the weight traffic dominates again.
+        if out >= 16384 or contraction >= 8192:
+            return _TILE_WIDE
+        if out >= 8192:
+            return _TILE_MID
+        return _TILE_SMALL_M
     if out <= 1280 and M >= 1024:
         # narrow output: a 256-wide tile is mostly tail, but it needs enough M tile rows to fill the CUs
         return _TILE_NARROW

@@ -18,15 +18,10 @@ from .tiles import gemm_block_sizes
 
 # Tile shapes the heuristic can return, each an alias for one row of `SCALED_MM_TILES`, named by the
 # (block_m x block_n) box it covers. The last field overlaps the refill with the WMMAs, which pays on the
-# short tiles (64x64, 64x128, 32x64, 16x64) and loses on the tall ones.
+# short tiles (16x64, 32x64, 64x128) and loses on the tall ones.
 _TILE_16x256 = (1, 8, 4, 1, 2, 0)
 _TILE_16x64 = (1, 2, 4, 1, 2, 1)
-_TILE_64x64 = (2, 2, 2, 2, 2, 1)
-# The same box without the overlapped refill. It is the fp16-activation choice: with fp16 A the prefetch row
-# measures 12-67% slower on the cells this tile serves (`M <= 256`), while with bf16 A it is 17-52% faster.
-# The prefetch staging splits the A fetch from its LDS store, and for a plain fp16 copy the compiler schedules
-# that pair worse than the fused load-store the non-prefetch row keeps.
-_TILE_64x64_PLAIN = (2, 2, 2, 2, 2, 0)
+_TILE_32x64 = (1, 2, 2, 2, 2, 1)
 _TILE_64x128 = (1, 4, 2, 4, 2, 1)
 _TILE_128x128 = (2, 2, 2, 4, 4, 0)
 _TILE_128x256 = (1, 8, 4, 8, 2, 0)
@@ -47,23 +42,31 @@ def select_scaled_mm_config(
 ) -> tuple[int, int, int, int, int, int]:
     """Static tile choice for one shape.
 
-    Fitted on the 139-cell table in the fp8 plan, over the ten boxes that sweep measured. Above 512 rows
-    the short 64x128 tile with the refill overlapped is the default, because the weight traffic it re-reads
-    is what binds and a taller tile only helps once `N` is wide enough that the grid, not the traffic,
-    would starve. 1024-wide and 1281-1792-wide outputs are the exception, where a 16-row tile keeps enough
-    blocks in flight to beat every taller one. At 512 rows the tile height is already bought (four M tiles),
-    so the output width and the reduction length decide. The boundaries are measured, not derived: re-fit
-    them with `python -m bench.benchmark_scaled_mm_hip --tiles` rather than reasoning about them.
+    Fitted on the shared grid in `bench/cells.py`. The tile height tracks the block count until M is large
+    enough that the weight traffic binds: below 128 rows a 16-row tile is the throughput, 129-256 rows want
+    64 columns x 128 rows, and above 512 rows the short 64x128 tile with the refill overlapped is the
+    default, because the weight traffic it re-reads is what binds and a taller tile only helps once `N` is
+    wide enough that the grid, not the traffic, would starve. The 1024-wide and 1281-1792-wide outputs are
+    the exception, where a 16-row tile keeps enough blocks in flight to beat every taller one. At 512 rows
+    the tile height is already bought (four M tiles), so the output width and the reduction length decide.
+    The boundaries are measured, not derived: re-fit them with `python -m bench.benchmark_scaled_mm_hip
+    --tiles` rather than reasoning about them.
     """
-    del b_dtype, out_dtype
-    small = _TILE_64x64 if a_dtype is not torch.float16 else _TILE_64x64_PLAIN
+    del a_dtype, b_dtype, out_dtype
 
     if M <= 16:
-        return _TILE_16x256
+        # A row or two: a 16-row tile is the only way to get enough blocks, and at that height the N panel has
+        # to be narrow too (16x64 is 1.6-2.7x the 16x256 tile on every cell measured) unless the weight is so
+        # wide that streaming it is the whole cost (`1 x 96768 x 2688`).
+        return _TILE_16x256 if N >= 16384 else _TILE_16x64
     if M <= 128:
-        return small
+        # 1.2-2.4x the 64-wide tile: at these row counts the block count is the throughput, so the 64-row tile
+        # buys nothing and the narrower one buys parallelism.
+        return _TILE_32x64 if N >= 8192 else _TILE_16x64
     if M <= 256:
-        return small if N <= 4096 else _TILE_64x128
+        # Past 128 rows the 64x128 tile is the pick (1.3-1.4x the 64-wide one), except over a long contraction
+        # where the 32x64 tile's extra blocks still win.
+        return _TILE_32x64 if N <= 4096 and K >= 8192 else _TILE_64x128
     if M <= 512:
         if N <= 2560:
             return _TILE_64x128

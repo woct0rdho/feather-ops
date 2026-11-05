@@ -153,8 +153,9 @@ def test_every_table_config(cfg, transposed_b):
 @pytest.mark.parametrize(
     ("M", "N", "K", "expected_tile"),
     [
-        (1, 4096, 4096, (64, 64)),
-        (16, 6144, 6144, (64, 64)),
+        # a row or two: 16 rows instead of 64 keeps four times the blocks in flight
+        (1, 4096, 4096, (16, 64)),
+        (16, 6144, 6144, (16, 64)),
         (1024, 1152, 1152, (256, 128)),
         (2048, 2048, 2048, (128, 128)),
         (4096, 8192, 2048, (256, 256)),
@@ -190,17 +191,21 @@ def test_shape_heuristic(M, N, K, expected_tile):
         (256, 4096, 4096, False, (64, 64)),
         (128, 8192, 5120, True, (64, 64)),
         (32, 25600, 5120, False, (64, 64)),  # 32-token prompt
-        (1, 96768, 2688, False, (64, 64)),  # H3 adaln, group 64
+        (1, 96768, 2688, False, (16, 64)),  # H3 adaln, group 64: +4% over 64x64
+        (16, 6144, 6144, True, (16, 64)),  # +15-20% over 64x64 in the gradient direction
         # ... but a wide output pays for the 128x128 tile's larger N panel even at these row counts
         (192, 12288, 4096, False, (128, 128)),  # the 64x64 tile loses 1.34x
         (192, 12288, 4096, True, (64, 64)),  # the gradient's output is K = 4096, not 12288
         (128, 12288, 4096, False, (128, 128)),  # 64x64 loses 1.38x. 256x256 loses 2x
         (256, 12288, 4096, False, (128, 128)),
-        # M = 512 with a power-of-two 4096 contraction: the L2-aliasing exception needs a mid-size M, here the
-        # 256x256 tile is 20-29% faster than the 128x128 the exception used to pick
-        (512, 4096, 4096, False, (256, 256)),
-        (512, 4096, 4096, True, (256, 256)),
-        (512, 2048, 1024, True, (128, 128)),  # short contraction at M = 512: 128x128 is the best of the 16
+        # M = 512: four 128-row tiles, so the output width decides. Below 8192 the 64x64 tile wins (+4% on
+        # 4096x4096, +29% on 2048x1024), which is what the earlier 256x256 rule got wrong.
+        (512, 4096, 4096, False, (64, 64)),
+        (512, 4096, 4096, True, (64, 64)),
+        (512, 2048, 1024, True, (64, 64)),
+        # ... a long reduction or a huge output puts the weight traffic back in charge
+        (512, 12288, 4096, False, (128, 128)),
+        (512, 248320, 4096, False, (256, 256)),
         (4112, 4096, 4096, True, (128, 128)),  # ... while a mid-size M still prefers 128x128 (+3.5%)
         (9232, 4096, 4096, True, (256, 256)),
     ],

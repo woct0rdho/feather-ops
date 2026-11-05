@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kernel-only sweep of `feather_ops.int8_scaled_mm` over the model cells of the int8 ConvRot plan.
+"""Kernel-only sweep of `feather_ops.int8_scaled_mm` over the shared grid in bench/cells.py.
 
 Every cell is (M, N_w, K_w) where N_w/K_w are the weight's output/input axes. The forward contracts K_w
 (out = N_w) and the backward contracts N_w (out = K_w), so one cell covers both directions of the same
@@ -18,29 +18,10 @@ import argparse
 
 import torch
 
+from bench.cells import cells
 from bench.protocol import Case, add_protocol_args, run_cases
 from feather_ops.int8_convrot import int8_scaled_mm, prepack_int8_convrot_weight, select_int8_config
 from feather_ops.tiles import INT8_TILES
-
-# (name, [(M, N_w, K_w), ...])
-CELLS = [
-    ("krea2", [(4112, 6144, 6144), (4112, 1536, 6144), (4112, 16384, 6144), (4112, 6144, 16384), (9232, 6144, 6144), (9232, 1536, 6144), (9232, 16384, 6144)]),
-    ("qwen", [(4112, 4096, 4096), (4112, 24576, 4096), (4112, 4096, 12288), (9232, 4096, 4096)]),
-    ("zimage", [(4128, 11520, 3840), (4128, 3840, 3840), (4128, 10240, 3840), (4128, 3840, 10240)]),
-    ("h3", [(5376, 21504, 5376), (5376, 5376, 7168), (5376, 28672, 5376), (5376, 5376, 14336), (25344, 21504, 5376)]),
-    ("moss", [(4112, 9216, 3072), (4112, 3072, 3072), (4112, 16384, 3072), (4112, 3072, 8192)]),
-    ("klein", [(4096, 12288, 4096), (4096, 4096, 4096), (4096, 24576, 4096), (4096, 4096, 12288), (4608, 36864, 4096), (4608, 4096, 16384), (9728, 4096, 4096)]),
-    ("anima", [(4096, 2048, 2048), (512, 2048, 1024), (4096, 8192, 2048), (4096, 2048, 8192), (9216, 2048, 2048), (9216, 8192, 2048)]),
-    ("text-enc", [(512, 12288, 4096), (1024, 4096, 4096), (2048, 1152, 1152), (1024, 3456, 1152), (2048, 4304, 1152), (2048, 1152, 4304), (512, 248320, 4096)]),
-    ("path", [(1, 36864, 6144), (16, 6144, 6144), (192, 2560, 2560), (512, 4096, 4096), (2048, 6144, 6144), (3072, 6144, 6144), (4096, 3456, 1152)]),
-    # coverage audit: cells a training step runs that the model rows above do not list
-    ("h3-adaln", [(1, 96768, 2688)]),  # adaln_proj.linear, group 64, forward only, M = batch
-    ("krea2-musubi", [(2560, 6144, 6144), (4352, 6144, 6144), (4352, 1536, 6144), (4352, 16384, 6144), (4352, 6144, 16384), (9472, 16384, 6144)]),  # M padded to 256
-    ("h3-ragged", [(5251, 21504, 5376), (25343, 21504, 5376)]),  # video+audio+text rows are not 256-aligned
-    ("text-enc-short", [(32, 25600, 5120), (32, 5120, 25600), (128, 1024, 5120), (128, 8192, 5120)]),  # short prompts
-    # the small-M tiers: TE at 192/256 tokens (the 64x64 tile's crossover is on the output width, not M)
-    ("text-enc-192", [(192, 2560, 2560), (192, 12288, 4096), (256, 12288, 4096), (256, 4096, 4096)]),
-]
 
 DEV = "cuda"
 DTYPE = torch.bfloat16
@@ -80,7 +61,7 @@ def main():
     parser.add_argument("--dir", choices=["fwd", "bwd", "both"], default="fwd")
     parser.add_argument("--configs", default="", help="comma separated INT8_TILES indices. Default is the heuristic")
     parser.add_argument("--all-configs", action="store_true", help="every schedule as a provider")
-    parser.add_argument("--groups", default="", help="comma separated cell groups")
+    parser.add_argument("--groups", default="", help="comma separated grid groups (bench/cells.py)")
     parser.add_argument("--no-bf16", action="store_true", help="do not time the bf16 GEMM control")
     add_protocol_args(parser)
     args = parser.parse_args()
@@ -94,9 +75,9 @@ def main():
 
     wanted = {value.strip() for value in args.groups.split(",")} if args.groups else None
     directions = {"fwd": [False], "bwd": [True], "both": [False, True]}[args.dir]
-    cells = [(M, N_w, K_w) for name, group in CELLS if wanted is None or name in wanted for M, N_w, K_w in group]
+    grid = [(M, N_w, K_w) for _group, M, N_w, K_w in cells(wanted)]
 
-    cases = [build_case(M, N_w, K_w, transposed_b, configs, not args.no_bf16) for transposed_b in directions for M, N_w, K_w in cells]
+    cases = [build_case(M, N_w, K_w, transposed_b, configs, not args.no_bf16) for transposed_b in directions for M, N_w, K_w in grid]
     run_cases(
         cases,
         unit="TFLOPS",
